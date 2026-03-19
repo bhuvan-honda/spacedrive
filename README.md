@@ -28,6 +28,14 @@ End-to-end autonomous driving methods built on vision language models (VLMs) hav
 - [2026/02/21] SpaceDrive is accepted by [CVPR 2026](https://cvpr2026.thecvf.com/)! 🎉
 
 ## ⌨️ Code
+Clone this repository **with submodules**.
+```
+# start a fresh clone with submodules
+git clone --recursive https://github.com/zhenghao2519/SpaceDrive.git
+
+# or update submodules if you have already cloned 
+git submodule update --init --recursive
+```
 Follow the instructions below to start:
 1. [Data & Model Preperation](docs/data_model.md)
 2. [Environment Setup](docs/env_setup.md)
