@@ -285,23 +285,21 @@ class CustomQwen2_5_VLForConditionalGeneration(Qwen2_5_VLForConditionalGeneratio
                 gt_pos = torch.empty((0,  self.llm_hidden_dim)).to(labels.device)
                 gt_coords_xy = torch.empty((0, 2)).to(labels.device)
             else:
+
+                num_valid = has_gt_planning.sum()
+                
                 if planning_only:
                     # only select the first six coords for loss_pos calculation
                     if io_coords_pos is not None:
-                        output_pos = output_pos.reshape(B, -1, self.llm_hidden_dim)[:, :6, :] # select the first six coords
-                        gt_pos = gt_pos.reshape(B, -1, self.llm_hidden_dim)[:, :6, :] # select the first six coords
-                        gt_coords_xy = gt_coords_xy.reshape(B, -1, 2)[:, :6, :] # select the first six coords
+                        output_pos = output_pos.reshape(num_valid, -1, self.llm_hidden_dim)[:, :6, :] # select the first six coords
+                        gt_pos = gt_pos.reshape(num_valid, -1, self.llm_hidden_dim)[:, :6, :] # select the first six coords
+                        gt_coords_xy = gt_coords_xy.reshape(num_valid, -1, 2)[:, :6, :] # select the first six coords
                 elif single_coords_only:
                     # only select the first coords for loss_pos calculation
                     if io_coords_pos is not None: # NOTE: make sure it also has at least one coords
-                        output_pos = output_pos.reshape(B, -1, self.llm_hidden_dim)[:, :1, :].unsqueeze(1) # select the first coords
-                        gt_pos = gt_pos.reshape(B, -1, self.llm_hidden_dim)[:, :1, :].unsqueeze(1) # select the first coords
-                        gt_coords_xy = gt_coords_xy.reshape(B, -1, 2)[:, :6, :] # select the first six coords
-
-                if not has_gt_planning.all(): # select only the samples with gt planning for loss calculation
-                    num_valid = has_gt_planning.sum()
-                    output_pos = output_pos.reshape(num_valid, -1, output_pos.shape[-1])
-                    gt_coords_xy = gt_coords_xy.reshape(num_valid, -1, 2)
+                        output_pos = output_pos.reshape(num_valid, -1, self.llm_hidden_dim)[:, :1, :].unsqueeze(1) # select the first coords
+                        gt_pos = gt_pos.reshape(num_valid, -1, self.llm_hidden_dim)[:, :1, :].unsqueeze(1) # select the first coords
+                        gt_coords_xy = gt_coords_xy.reshape(num_valid, -1, 2)[:, :6, :] # select the first six coords
 
             
             loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size , weight=weighted_mask, num_items_in_batch=torch.tensor(B))
