@@ -18,16 +18,31 @@
 
 ##
 
-End-to-end autonomous driving methods built on vision language models (VLMs) have undergone rapid development driven by their universal visual understanding and strong reasoning capabilities obtained from the large-scale pretraining. However, we find that current VLMs struggle to understand fine-grained 3D spatial relationships which is a fundamental requirement for systems interacting with the physical world.To address this issue, we propose SpaceDrive, a spatial-aware VLM-based driving framework that treats spatial information as explicit positional encodings (PEs) instead of textual digit tokens, enabling joint reasoning over semantic and spatial representations. SpaceDrive employs a universal positional encoder to all 3D coordinates derived from multi-view depth estimation, historical ego-states, and text prompts. These 3D PEs are first superimposed to augment the corresponding 2D visual tokens. Meanwhile, they serve as a task-agnostic coordinate representation, replacing the digit-wise numerical tokens as both inputs and outputs for the VLM. This mechanism enables the model to better index specific visual semantics in spatial reasoning and directly regress trajectory coordinates rather than generating digit-by-digit, thereby enhancing planning accuracy. Extensive experiments validate that SpaceDrive achieves state-of-the-art open-loop performance on the nuScenes dataset and the second-best Driving Score of 78.02 on the Bench2Drive closed-loop benchmark over existing VLM-based methods.
+End-to-end autonomous driving methods built on vision language models (VLMs) have undergone rapid development driven by their universal visual understanding and strong reasoning capabilities obtained from the large-scale pretraining. However, we find that current VLMs struggle to understand fine-grained 3D spatial relationships which is a fundamental requirement for systems interacting with the physical world. To address this issue, we propose SpaceDrive, a spatial-aware VLM-based driving framework that treats spatial information as explicit positional encodings (PEs) instead of textual digit tokens, enabling joint reasoning over semantic and spatial representations. SpaceDrive employs a universal positional encoder to all 3D coordinates derived from multi-view depth estimation, historical ego-states, and text prompts. These 3D PEs are first superimposed to augment the corresponding 2D visual tokens. Meanwhile, they serve as a task-agnostic coordinate representation, replacing the digit-wise numerical tokens as both inputs and outputs for the VLM. This mechanism enables the model to better index specific visual semantics in spatial reasoning and directly regress trajectory coordinates rather than generating digit-by-digit, thereby enhancing planning accuracy. Extensive experiments validate that SpaceDrive achieves state-of-the-art open-loop performance on the nuScenes dataset and the second-best Driving Score of 78.02 on the Bench2Drive closed-loop benchmark over existing VLM-based methods.
 
 ![](./assets/architecture.png)
 
 ## 📰 News
 
 - [2025/12/11] Paper is released on [arXiv](https://arxiv.org/abs/2512.10719).
+- [2026/02/21] SpaceDrive is accepted by [CVPR 2026](https://cvpr2026.thecvf.com/)! 🎉
 
 ## ⌨️ Code
-The code is currently under the internal review process and will be released soon.
+Follow the instructions below to start:
+1. [Data & Model Preperation](docs/data_model.md)
+2. [Environment Setup](docs/env_setup.md)
+3. [Train & Test](docs/train_test.md)
+
+## 🔥 Pre-trained models
+The config file can be found in [`projects/configs`](projects/configs). The results below are achieved on the nuScenes dataset.
+
+| Method | Base VLM | Config | Weights | Avg. L2 ↓ | Avg. Collision ↓ | Avg. Intersection ↓ |
+| :--- | :--- | :-: | :-: | :---: | :---: | :---: |
+| **SpaceDrive** | LLaVA-1.5-7B | [config](projects/configs/spacedrive/spacedrive_llava.py) | [model](https://huggingface.co/zhenghao2519/spacedrive-llava1.5-7b-unidepth) | 1.82 | 2.44 | 4.08 |
+| **SpaceDrive** | Qwen2.5-VL-7B | [config](projects/configs/spacedrive/spacedrive_qwen.py) | [model](https://huggingface.co/zhenghao2519/spacedrive-qwen2.5vl-7b-unidepth) | 1.80 | 1.88 | 4.21 |
+| **SpaceDrive+** | LLaVA-1.5-7B | [config](projects/configs/spacedrive/spacedrive_plus_llava.py) | [model](https://huggingface.co/zhenghao2519/spacedrive_plus-llava1.5-7b-unidepth) | 0.31 | 0.23 | 1.42 |
+| **SpaceDrive+** | Qwen2.5-VL-7B | [config](projects/configs/spacedrive/spacedrive_plus_qwen.py) | [model](https://huggingface.co/zhenghao2519/spacedrive_plus-qwen2.5vl-7b-unidepth) | 0.32 | 0.23 | 1.27 |
+
 
 ## 🎥 Visualizations
 
@@ -60,7 +75,7 @@ The code is currently under the internal review process and will be released soo
 ## 📜 License
 SpaceDrive is released under the MIT license. Please see the [LICENSE](LICENSE) file for more information.
 
-## 🔗 Citation -->
+## 🔗 Citation
 ```
 @article{li2025spacedrive,
   title={SpaceDrive: Infusing Spatial Awareness into VLM-based Autonomous Driving},

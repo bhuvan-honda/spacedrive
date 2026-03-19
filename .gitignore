@@ -1,0 +1,17 @@
+**__pycache__**
+ckpts/
+data/
+
+work_dirs/
+vis/
+workspace
+
+.vscode
+*.ignore
+*.onnx
+*.engine
+*.nsys-rep
+*.tmp
+*.log
+*.pyc
+
