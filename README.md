@@ -92,3 +92,6 @@ SpaceDrive is released under the MIT license. Please see the [LICENSE](LICENSE) 
   year={2025}
 }
 ```
+
+## 🙌 Acknowledgement
+This work is a result of the joint research project STADT:up (Förderkennzeichen 19A22006O). The project is supported by the German Federal Ministry for Economic Affairs and Climate Action (BMWK), based on a decision of the German Bundestag. The author is solely responsible for the content of this publication.
