@@ -34,7 +34,7 @@ from nuscenes.utils.geometry_utils import view_points
 from functools import partial
 
 # Recommended style to use as the plots will show grids.
-plt.style.use('seaborn-whitegrid')
+plt.style.use('seaborn-v0_8-whitegrid')
 
 # Define a map geometry type for polygons and lines.
 Geometry = Union[Polygon, LineString]

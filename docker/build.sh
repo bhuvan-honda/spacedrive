@@ -15,7 +15,7 @@ set -ex
 # # # # # # # # # # #
 
 # actual build
-sudo docker build . \
+docker build . \
   --build-arg INSIDE_DOCKER_PROXY=$INSIDE_DOCKER_PROXY \
   --build-arg HOST_UNAME=$USER \
   --build-arg HOST_UID=$(id -u) \

@@ -76,7 +76,7 @@ include_semantic_posemb = False # include semantic posemb in 3d positional encod
 supervise_semantic_posemb = False # use cross entropy loss to supervise semantic posemb, if True, the semantic posemb is supervised by the semantic labels
 
 # save paths
-base_path = 'workspace/spacedrive_plus_qwen/'
+base_path = '/workspace/spacedrive_plus_qwen_new_train/'
 work_dir = base_path
 results_path = base_path + '_results_planning_only/'
 wb_run_name = base_path + 'debug_run'
