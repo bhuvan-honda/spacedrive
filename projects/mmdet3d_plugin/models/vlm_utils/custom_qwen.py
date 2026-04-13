@@ -105,6 +105,8 @@ class CustomQwen2_5_VLForConditionalGeneration(Qwen2_5_VLForConditionalGeneratio
         ego_feature: Optional[torch.Tensor] = None, # shape (B, 1, hidden)
         enable_pe_input = False, # enable the use of PE in autoregressive manner, if False, only use PE for supervision
         pos_index: Optional[torch.Tensor] = None,
+        depth_pixel_values: Optional[torch.Tensor] = None, # depth maps processed as pseudo-RGB through image processor
+        depth_image_grid_thw: Optional[torch.LongTensor] = None,
     ) -> Union[Tuple, Qwen2_5_VLCausalLMOutputWithPast]:
         r"""
         labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
@@ -160,6 +162,10 @@ class CustomQwen2_5_VLForConditionalGeneration(Qwen2_5_VLForConditionalGeneratio
         if pixel_values is not None:
             pixel_values = pixel_values.reshape(-1, pixel_values.shape[-1])
             image_grid_thw = image_grid_thw.reshape(-1, image_grid_thw.shape[-1])
+
+        if depth_pixel_values is not None:
+            depth_pixel_values = depth_pixel_values.reshape(-1, depth_pixel_values.shape[-1])
+            depth_image_grid_thw = depth_image_grid_thw.reshape(-1, depth_image_grid_thw.shape[-1])
 
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -225,6 +231,8 @@ class CustomQwen2_5_VLForConditionalGeneration(Qwen2_5_VLForConditionalGeneratio
             include_semantic_posemb = include_semantic_posemb,
             ego_feature = ego_feature,
             pos_index = pos_index,
+            depth_pixel_values = depth_pixel_values,
+            depth_image_grid_thw = depth_image_grid_thw,
         )
 
         hidden_states = outputs[0] # Note: This is hidden states before the cls head
@@ -675,6 +683,8 @@ class CustomQwen2_5_VLModel(Qwen2_5_VLModel):
         ego_feature: Optional[torch.Tensor] = None,
         enable_pe_input: Optional[bool] = False,
         pos_index: Optional[torch.Tensor] = None,
+        depth_pixel_values: Optional[torch.Tensor] = None,
+        depth_image_grid_thw: Optional[torch.LongTensor] = None,
     ) -> Union[Tuple, Qwen2_5_VLModelOutputWithPast]:
         r"""
         pixel_values_videos (`torch.FloatTensor` of shape `(seq_length, num_channels * temporal_size * image_size * image_size)):
@@ -753,7 +763,16 @@ class CustomQwen2_5_VLModel(Qwen2_5_VLModel):
                     )
                 image_embeds = image_embeds + pos_emb # shape [B, N, C]
                 
-                
+            # NOTE: HERE we add the depth visual embeddings on top of the image embeddings
+            if depth_pixel_values is not None:
+                with torch.no_grad():
+                    depth_embeds = self.get_image_features(depth_pixel_values, depth_image_grid_thw)
+                if depth_embeds.shape[0] != image_embeds.shape[0]:
+                    raise ValueError(
+                        f"Depth embedding count {depth_embeds.shape[0]} does not match image embedding count {image_embeds.shape[0]}. "
+                        f"Ensure depth maps have the same spatial resolution as input images."
+                    )
+                image_embeds = image_embeds + depth_embeds
 
             # NOTE: HERE starts the ego feature insertion
             if ego_feature is not None:

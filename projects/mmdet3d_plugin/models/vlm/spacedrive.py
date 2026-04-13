@@ -77,6 +77,7 @@ class SpaceDrive(MVXTwoStageDetector):
                  learnable_pe_scaling=False, # if True, the pe_scaling is learnable, if False, the pe_scaling is fixed
                  depth_model_type = 'depth_anything', # 'depth_anything' or 'unidepth'
                  use_rope = False,
+                 vis_depth_tokens=False, # pass depth maps through vision encoder and add to vision tokens
                  ):
         
         super(SpaceDrive, self).__init__(train_cfg, test_cfg,)
@@ -100,6 +101,9 @@ class SpaceDrive(MVXTwoStageDetector):
         self.ego_status_len = ego_status_len
         if self.ego_status is not None:
             self.reset_memory()
+
+        # depth-as-vision config
+        self.vis_depth_tokens = vis_depth_tokens
 
         # ablations
         self.input_pe_mlp = input_pe_mlp
@@ -169,7 +173,7 @@ class SpaceDrive(MVXTwoStageDetector):
                     self.position_encoder_mlp = nn.Linear(3, self.llm_hidden_dim)
 
         # depth model init
-        if self.vis_3d_pos:
+        if self.vis_3d_pos or self.vis_depth_tokens:
             self.depth_model_type = depth_model_type
             if self.depth_model_type == 'depth_anything':
                 self.depth_anything_processor =  AutoImageProcessor.from_pretrained("depth-anything/Depth-Anything-V2-Metric-Outdoor-Large-hf")
@@ -253,6 +257,31 @@ class SpaceDrive(MVXTwoStageDetector):
                 )
 
 
+
+    def prepare_depth_visual_input(self, depth):
+        """Convert depth maps to pseudo-RGB and process through Qwen image processor.
+        
+        Args:
+            depth: torch.Tensor (B, N_views, H, W)
+        Returns:
+            depth_pixel_values: patch-formatted tensor for the visual encoder
+            depth_image_grid_thw: grid dimensions for the visual encoder
+        """
+        B, N, H, W = depth.shape
+        depth_imgs = []
+        for b in range(B):
+            for n in range(N):
+                d = depth[b, n].detach().cpu().float().numpy()
+                d_min, d_max = d.min(), d.max()
+                d_norm = ((d - d_min) / (d_max - d_min + 1e-5) * 255).astype(np.uint8)
+                d_rgb = np.stack([d_norm, d_norm, d_norm], axis=-1)  # (H, W, 3)
+                depth_imgs.append(d_rgb)
+        
+        visual_processed = self.processor.image_processor(
+            images=depth_imgs, return_tensors="pt")
+        depth_pv = visual_processed["pixel_values"].to(depth.device)
+        depth_grid = visual_processed["image_grid_thw"].to(depth.device)
+        return depth_pv, depth_grid
 
     @property
     def with_lm_head(self):
@@ -576,12 +605,21 @@ class SpaceDrive(MVXTwoStageDetector):
         B = pixel_values.shape[0]
         
         pos_embed = None
+        depth = None
         if self.vis_3d_pos:
             depth = self.depth_prediction(data['img'], data['intrinsics'])
 
             location = self.prepare_location(image_grid_thw, pixel_values)
 
             pos_embed, coords3d = self.position_embeding(data, location, img_metas, depth, image_grid_thw, False, data['img'], sample_idx=img_metas[0]['sample_idx'])  # (6, 640, 640, 3) to (6,46,46). shape (B, seq_len, hidden_dim)
+
+        # depth-as-vision: convert depth maps to pseudo-RGB and process through image processor
+        depth_pixel_values = None
+        depth_image_grid_thw = None
+        if self.vis_depth_tokens:
+            if depth is None:
+                depth = self.depth_prediction(data['img'], data['intrinsics'])
+            depth_pixel_values, depth_image_grid_thw = self.prepare_depth_visual_input(depth)
 
         io_coords_pos = None
         if self.io_3d_pos:
@@ -679,6 +717,8 @@ class SpaceDrive(MVXTwoStageDetector):
                 ego_feature = ego_feature if self.ego_status and ego_feature.numel() > 0  else None,
                 enable_pe_input = self.enable_pe_input if self.io_3d_pos else False,
                 pos_index = coords3d if self.use_rope else None,
+                depth_pixel_values=depth_pixel_values,
+                depth_image_grid_thw=depth_image_grid_thw,
             )
 
             losses.update(vlm_loss=lm_loss['loss'])
@@ -764,6 +804,7 @@ class SpaceDrive(MVXTwoStageDetector):
         B = pixel_values.shape[0]
         
         pos_embed = None
+        depth = None
         if self.vis_3d_pos:
 
             depth = self.depth_prediction(img,  data['intrinsics'])
@@ -771,6 +812,14 @@ class SpaceDrive(MVXTwoStageDetector):
             location = self.prepare_location(image_grid_thw, pixel_values)
 
             pos_embed, coords3d = self.position_embeding(data, location, img_metas, depth, image_grid_thw) 
+
+        # depth-as-vision: convert depth maps to pseudo-RGB and process through image processor
+        depth_pixel_values = None
+        depth_image_grid_thw = None
+        if self.vis_depth_tokens:
+            if depth is None:
+                depth = self.depth_prediction(img, data['intrinsics'])
+            depth_pixel_values, depth_image_grid_thw = self.prepare_depth_visual_input(depth)
 
         io_coords_pos = None
         if self.io_3d_pos and 'coords_pos_tensor' in data:
@@ -856,6 +905,8 @@ class SpaceDrive(MVXTwoStageDetector):
                         pos_index = coords3d if self.use_rope else None,
                         coords_encoder = self.position_encoder_mlp if (not self.single_token_output and self.pe_decode_method is not None and 'mlp' in self.pe_decode_method and self.input_pe_mlp) else self.position_encoder,
                         coords_decoder = self.mlp_output_coords  if  (not self.single_token_output and self.pe_decode_method is not None  and 'mlp' in self.pe_decode_method and not self.use_vae_to_replace_mlp) else  (self.vae_output_coords if self.use_vae_to_replace_mlp else None),
+                        depth_pixel_values=depth_pixel_values,
+                        depth_image_grid_thw=depth_image_grid_thw,
                         ## output args
                         output_hidden_states=True,
                         return_dict_in_generate=True,
@@ -886,6 +937,8 @@ class SpaceDrive(MVXTwoStageDetector):
                         enable_pe_input = self.enable_pe_input if self.io_3d_pos else False,
                         coords_encoder = self.position_encoder_mlp if (not self.single_token_output and self.pe_decode_method is not None and 'mlp' in self.pe_decode_method and self.input_pe_mlp) else self.position_encoder,
                         coords_decoder = self.mlp_output_coords  if  (not self.single_token_output and self.pe_decode_method is not None  and 'mlp' in self.pe_decode_method and not self.use_vae_to_replace_mlp) else  (self.vae_output_coords if self.use_vae_to_replace_mlp else None),
+                        depth_pixel_values=depth_pixel_values,
+                        depth_image_grid_thw=depth_image_grid_thw,
                         ## output args
                         output_hidden_states=True,
                         return_dict_in_generate=True,

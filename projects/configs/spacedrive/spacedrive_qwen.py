@@ -22,6 +22,7 @@ lr = 1e-4 /2 * batch_size / 8 * num_gpus
 ############### SpaceDrive Config ###############
 vis_3d_pos = True # enable PE on vision tokens
 io_3d_pos = True # enable PE in inputs/outputs
+vis_depth_tokens = True # pass depth maps through vision encoder and add to vision tokens (PE + DEPTH + VISION)
 
 # depth model config
 depth_model_type = 'unidepth' # 'depth_anything' or 'unidepth'
@@ -126,6 +127,8 @@ model = dict(
     # depth model config
     depth_model_type=depth_model_type,
     learnable_pe_scaling=learnable_pe_scaling,
+    # depth-as-vision config
+    vis_depth_tokens=vis_depth_tokens,
 )
 
 ############### data ###############

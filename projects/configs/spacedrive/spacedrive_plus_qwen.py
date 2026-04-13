@@ -22,6 +22,7 @@ lr = 1e-4 /2 * batch_size / 8 * num_gpus
 ############### SpaceDrive Config ###############
 vis_3d_pos = True # enable PE on vision tokens
 io_3d_pos = True # enable PE in inputs/outputs
+vis_depth_tokens = True # pass depth maps through vision encoder and add to vision tokens (PE + DEPTH + VISION)
 
 # depth model config
 depth_model_type = 'unidepth' # 'depth_anything' or 'unidepth'
@@ -76,7 +77,7 @@ include_semantic_posemb = False # include semantic posemb in 3d positional encod
 supervise_semantic_posemb = False # use cross entropy loss to supervise semantic posemb, if True, the semantic posemb is supervised by the semantic labels
 
 # save paths
-base_path = '/workspace/spacedrive_plus_qwen_new_train/'
+base_path = '/workspace/spacedrive_plus_qwen_depth_skip/'
 work_dir = base_path
 results_path = base_path + '_results_planning_only/'
 wb_run_name = base_path + 'debug_run'
@@ -126,6 +127,8 @@ model = dict(
     # depth model config
     depth_model_type=depth_model_type,
     learnable_pe_scaling=learnable_pe_scaling,
+    # depth-as-vision config
+    vis_depth_tokens=vis_depth_tokens,
 )
 
 ############### data ###############
