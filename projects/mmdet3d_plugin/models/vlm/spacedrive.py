@@ -32,6 +32,7 @@ from ...datasets.utils.constants import IGNORE_INDEX , IMAGE_TOKEN_INDEX, VISION
 from ..vlm_utils.misc import load_model, locations
 from ..vlm_utils.positional_encoding import PositionalEncoding3D
 from ..vlm_utils.distributions import  VAEPEDecoder
+from ..vlm_utils.cross_view_attention import CrossView3DAttention
 
 # Unidepth imports
 from unidepth.models import UniDepthV2
@@ -78,6 +79,10 @@ class SpaceDrive(MVXTwoStageDetector):
                  depth_model_type = 'depth_anything', # 'depth_anything' or 'unidepth'
                  use_rope = False,
                  vis_depth_tokens=False, # pass depth maps through vision encoder and add to vision tokens
+                 cross_view_attn=False, # enable Cross-View 3D-Aware Attention on PE embeddings
+                 cross_view_attn_heads=8, # number of attention heads for cross-view attention
+                 cross_view_attn_layers=2, # number of transformer layers for cross-view attention
+                 cross_view_attn_distance=10.0, # 3D distance threshold (meters) for sparse attention, <=0 for full
                  ):
         
         super(SpaceDrive, self).__init__(train_cfg, test_cfg,)
@@ -104,6 +109,9 @@ class SpaceDrive(MVXTwoStageDetector):
 
         # depth-as-vision config
         self.vis_depth_tokens = vis_depth_tokens
+
+        # cross-view 3D attention config
+        self.cross_view_attn = cross_view_attn
 
         # ablations
         self.input_pe_mlp = input_pe_mlp
@@ -171,6 +179,16 @@ class SpaceDrive(MVXTwoStageDetector):
                     )
                 elif pe_decode_method  == 'l2_coords_mlp':
                     self.position_encoder_mlp = nn.Linear(3, self.llm_hidden_dim)
+
+        # cross-view 3D-aware attention init
+        if self.cross_view_attn and self.vis_3d_pos:
+            self.cross_view_attention = CrossView3DAttention(
+                hidden_dim=self.llm_hidden_dim,
+                num_heads=cross_view_attn_heads,
+                num_layers=cross_view_attn_layers,
+                num_views=6,
+                distance_threshold=cross_view_attn_distance,
+            )
 
         # depth model init
         if self.vis_3d_pos or self.vis_depth_tokens:
@@ -613,6 +631,10 @@ class SpaceDrive(MVXTwoStageDetector):
 
             pos_embed, coords3d = self.position_embeding(data, location, img_metas, depth, image_grid_thw, False, data['img'], sample_idx=img_metas[0]['sample_idx'])  # (6, 640, 640, 3) to (6,46,46). shape (B, seq_len, hidden_dim)
 
+            # apply Cross-View 3D-Aware Attention to refine PE across views
+            if self.cross_view_attn:
+                pos_embed = self.cross_view_attention(pos_embed, coords3d)
+
         # depth-as-vision: convert depth maps to pseudo-RGB and process through image processor
         depth_pixel_values = None
         depth_image_grid_thw = None
@@ -812,6 +834,10 @@ class SpaceDrive(MVXTwoStageDetector):
             location = self.prepare_location(image_grid_thw, pixel_values)
 
             pos_embed, coords3d = self.position_embeding(data, location, img_metas, depth, image_grid_thw) 
+
+            # apply Cross-View 3D-Aware Attention to refine PE across views
+            if self.cross_view_attn:
+                pos_embed = self.cross_view_attention(pos_embed, coords3d)
 
         # depth-as-vision: convert depth maps to pseudo-RGB and process through image processor
         depth_pixel_values = None

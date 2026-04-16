@@ -73,7 +73,7 @@ RUN cd /deps \
     && git clone https://github.com/open-mmlab/mmdetection3d.git \
     && cd mmdetection3d \
     && git checkout tags/v${MMDET3D} \
-    && pip install "numpy<2.0.0" "scikit-image<0.20" "scikit-learn<1.3" "pandas<2.0.0" "opencv-python<4.9.0" "opencv-python-headless<4.9.0" \
+    && pip install "numpy<2.0.0" "scikit-image<0.20" "scikit-learn<1.3" "pandas<2.0.0" "opencv-python<4.9.0" "opencv-python-headless<4.9.0" "absl-py<2.0.0"\
     && python3.9 setup.py develop
 
 # Install unidepth_py3.9

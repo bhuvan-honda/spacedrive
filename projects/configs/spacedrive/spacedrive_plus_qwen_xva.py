@@ -67,6 +67,12 @@ ego_status = 'feature+PE' # 'feature', 'PE'. 'feature' means using a mlp to gene
 ego_status_len = 2 # ego status length
 load_ego_command_in_question = True # load command in language format in question
 
+# Cross-View 3D-Aware Attention (3D-XVA)
+cross_view_attn = True # enable cross-view attention on PE embeddings
+cross_view_attn_heads = 8 # number of attention heads
+cross_view_attn_layers = 2 # number of transformer layers
+cross_view_attn_distance = 10.0 # 3D distance threshold in meters, <=0 for full cross-view attention
+
 # other exps
 ## ablations
 load_high_level_command = False
@@ -77,7 +83,7 @@ include_semantic_posemb = False # include semantic posemb in 3d positional encod
 supervise_semantic_posemb = False # use cross entropy loss to supervise semantic posemb, if True, the semantic posemb is supervised by the semantic labels
 
 # save paths
-base_path = '/workspace/spacedrive_plus_qwen_new_train/'
+base_path = '/workspace/spacedrive_plus_qwen_xva/'
 work_dir = base_path
 results_path = base_path + '_results_planning_only/'
 wb_run_name = base_path + 'debug_run'
@@ -129,6 +135,11 @@ model = dict(
     learnable_pe_scaling=learnable_pe_scaling,
     # depth-as-vision config
     vis_depth_tokens=vis_depth_tokens,
+    # cross-view 3D attention config
+    cross_view_attn=cross_view_attn,
+    cross_view_attn_heads=cross_view_attn_heads,
+    cross_view_attn_layers=cross_view_attn_layers,
+    cross_view_attn_distance=cross_view_attn_distance,
 )
 
 ############### data ###############
