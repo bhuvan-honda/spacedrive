@@ -20,8 +20,8 @@ spacedrive_plus_qwen/
 spacedrive_plus_qwen_xva/
 spacedrive_plus_qwen_new_train/
 spacedrive_qwen/
+spacedrive_plus_qwen_upe/
 new_train/
 spacedrive_plus_qwen_depth_skip/
 dummy_images/
 infer_*/
-*_log.txt

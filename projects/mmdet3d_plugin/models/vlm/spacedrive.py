@@ -83,6 +83,7 @@ class SpaceDrive(MVXTwoStageDetector):
                  cross_view_attn_heads=8, # number of attention heads for cross-view attention
                  cross_view_attn_layers=2, # number of transformer layers for cross-view attention
                  cross_view_attn_distance=10.0, # 3D distance threshold (meters) for sparse attention, <=0 for full
+                 depth_uncertainty_pe=False, # enable Depth Uncertainty-Weighted PE (U-PE): blend 3D PE with learnable 2D PE based on depth confidence
                  ):
         
         super(SpaceDrive, self).__init__(train_cfg, test_cfg,)
@@ -112,6 +113,9 @@ class SpaceDrive(MVXTwoStageDetector):
 
         # cross-view 3D attention config
         self.cross_view_attn = cross_view_attn
+
+        # depth uncertainty PE config
+        self.depth_uncertainty_pe = depth_uncertainty_pe
 
         # ablations
         self.input_pe_mlp = input_pe_mlp
@@ -179,6 +183,23 @@ class SpaceDrive(MVXTwoStageDetector):
                     )
                 elif pe_decode_method  == 'l2_coords_mlp':
                     self.position_encoder_mlp = nn.Linear(3, self.llm_hidden_dim)
+
+        # depth uncertainty PE init
+        if self.depth_uncertainty_pe and self.vis_3d_pos:
+            # Learnable 2D PE: a parameter grid that provides fallback when depth is uncertain
+            # Max token grid size for 640x640 images with stride=14 and merge_size=2 is 23x23
+            self.pe_2d_max_h = 64
+            self.pe_2d_max_w = 64
+            self.pe_2d_embed = nn.Parameter(
+                torch.randn(1, self.pe_2d_max_h * self.pe_2d_max_w * 6, self.llm_hidden_dim) * 0.02
+            )
+            # Confidence projection: maps raw confidence to a gating scalar per token
+            self.confidence_gate = nn.Sequential(
+                nn.Linear(1, self.llm_hidden_dim),
+                nn.ReLU(),
+                nn.Linear(self.llm_hidden_dim, 1),
+                nn.Sigmoid(),
+            )
 
         # cross-view 3D-aware attention init
         if self.cross_view_attn and self.vis_3d_pos:
@@ -324,9 +345,11 @@ class SpaceDrive(MVXTwoStageDetector):
             img: torch.Tensor (batch_size, num_views, H, W, 3) # (640, 640, 3)
         Returns:
             depth: torch.Tensor (batch_size, num_views, H, W)
+            confidence: torch.Tensor (batch_size, num_views, H, W) or None
         '''
         B, N, C, H, W = img.shape
         device = img.device
+        confidence = None
 
         if self.depth_model_type == 'depth_anything':
             img = img.reshape(-1, img.shape[-3], img.shape[-2], img.shape[-1]).permute(0, 2, 3, 1) # (batch_size * num_views, H, W, 3)
@@ -342,9 +365,13 @@ class SpaceDrive(MVXTwoStageDetector):
             camera = Pinhole(K=intrinsics_torch)
             predictions = self.depth_model.infer(rgb_torch)
             predicted_depth = predictions["depth"]
+            # UniDepth provides per-pixel confidence (higher = more reliable depth)
+            if "confidence" in predictions:
+                raw_conf = predictions["confidence"]  # (B*N, 1, H_out, W_out)
+                confidence = raw_conf.view(B, N, raw_conf.shape[-2], raw_conf.shape[-1]).to(device)
 
         depth = predicted_depth.view(B, N, predicted_depth.shape[-2], predicted_depth.shape[-1]).to(device)
-        return depth
+        return depth, confidence
 
     def pool_downsample(self, img, output_size, mode='min'):
         '''
@@ -386,7 +413,7 @@ class SpaceDrive(MVXTwoStageDetector):
 
         return pooled_img
 
-    def position_embeding(self, data, memory_centers, img_metas, depth, image_grid_thw, visualize_pc=False, imgs=None, sample_idx=None):
+    def position_embeding(self, data, memory_centers, img_metas, depth, image_grid_thw, visualize_pc=False, imgs=None, sample_idx=None, depth_confidence=None):
         '''
         encode 3D position of each pixel in the image to a position embedding
         Args:
@@ -395,6 +422,7 @@ class SpaceDrive(MVXTwoStageDetector):
             img_metas: list[dict], contains 'pad_shape' for each image
             depth: torch.Tensor (B, num_views, H, W), the depth of each pixel in the image
             image_grid_thw: torch.Tensor (B, num_views, 3), the grid of each pixel in the image
+            depth_confidence: torch.Tensor (B, num_views, H, W), per-pixel depth confidence, or None
         '''
         B = data['intrinsics'].size(0)
 
@@ -452,6 +480,23 @@ class SpaceDrive(MVXTwoStageDetector):
             coords_position_embeding = self.position_encoder_mlp(coords3d)
         else: 
             coords_position_embeding = self.position_encoder(coords3d)
+
+        # Depth Uncertainty-Weighted PE: blend 3D PE with learnable 2D PE based on depth confidence
+        if self.depth_uncertainty_pe and depth_confidence is not None:
+            # Downsample confidence to token grid
+            conf = depth_confidence.reshape(-1, depth_confidence.shape[-2], depth_confidence.shape[-1]).unsqueeze(1)  # (B*N, 1, H, W)
+            conf = self.pool_downsample(conf, (img_token_h, img_token_w), 'avg')  # (B*N, 1, h, w)
+            conf = conf.permute(0, 2, 3, 1).reshape(B, LEN, 1)  # (B, N_views*h*w, 1)
+
+            # Compute gating weight from confidence
+            gate = self.confidence_gate(conf)  # (B, LEN, 1) in [0, 1]
+
+            # Get learnable 2D PE (truncate or interpolate to match token count)
+            pe_2d = self.pe_2d_embed[:, :LEN, :]  # (1, LEN, hidden_dim)
+            pe_2d = pe_2d.expand(B, -1, -1)  # (B, LEN, hidden_dim)
+
+            # Blend: high confidence → trust 3D PE, low confidence → fall back to 2D PE
+            coords_position_embeding = gate * coords_position_embeding + (1 - gate) * pe_2d
 
         return coords_position_embeding, coords3d
 
@@ -624,12 +669,13 @@ class SpaceDrive(MVXTwoStageDetector):
         
         pos_embed = None
         depth = None
+        depth_confidence = None
         if self.vis_3d_pos:
-            depth = self.depth_prediction(data['img'], data['intrinsics'])
+            depth, depth_confidence = self.depth_prediction(data['img'], data['intrinsics'])
 
             location = self.prepare_location(image_grid_thw, pixel_values)
 
-            pos_embed, coords3d = self.position_embeding(data, location, img_metas, depth, image_grid_thw, False, data['img'], sample_idx=img_metas[0]['sample_idx'])  # (6, 640, 640, 3) to (6,46,46). shape (B, seq_len, hidden_dim)
+            pos_embed, coords3d = self.position_embeding(data, location, img_metas, depth, image_grid_thw, False, data['img'], sample_idx=img_metas[0]['sample_idx'], depth_confidence=depth_confidence)  # (6, 640, 640, 3) to (6,46,46). shape (B, seq_len, hidden_dim)
 
             # apply Cross-View 3D-Aware Attention to refine PE across views
             if self.cross_view_attn:
@@ -640,7 +686,7 @@ class SpaceDrive(MVXTwoStageDetector):
         depth_image_grid_thw = None
         if self.vis_depth_tokens:
             if depth is None:
-                depth = self.depth_prediction(data['img'], data['intrinsics'])
+                depth, _ = self.depth_prediction(data['img'], data['intrinsics'])
             depth_pixel_values, depth_image_grid_thw = self.prepare_depth_visual_input(depth)
 
         io_coords_pos = None
@@ -827,13 +873,14 @@ class SpaceDrive(MVXTwoStageDetector):
         
         pos_embed = None
         depth = None
+        depth_confidence = None
         if self.vis_3d_pos:
 
-            depth = self.depth_prediction(img,  data['intrinsics'])
+            depth, depth_confidence = self.depth_prediction(img,  data['intrinsics'])
 
             location = self.prepare_location(image_grid_thw, pixel_values)
 
-            pos_embed, coords3d = self.position_embeding(data, location, img_metas, depth, image_grid_thw) 
+            pos_embed, coords3d = self.position_embeding(data, location, img_metas, depth, image_grid_thw, depth_confidence=depth_confidence) 
 
             # apply Cross-View 3D-Aware Attention to refine PE across views
             if self.cross_view_attn:
@@ -844,7 +891,7 @@ class SpaceDrive(MVXTwoStageDetector):
         depth_image_grid_thw = None
         if self.vis_depth_tokens:
             if depth is None:
-                depth = self.depth_prediction(img, data['intrinsics'])
+                depth, _ = self.depth_prediction(img, data['intrinsics'])
             depth_pixel_values, depth_image_grid_thw = self.prepare_depth_visual_input(depth)
 
         io_coords_pos = None
