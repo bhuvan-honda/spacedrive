@@ -25,3 +25,4 @@ dummy_images/
 infer_*/
 *.txt
 logs/
+results/
