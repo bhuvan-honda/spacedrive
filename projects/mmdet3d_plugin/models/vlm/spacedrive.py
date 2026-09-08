@@ -78,6 +78,7 @@ class SpaceDrive(MVXTwoStageDetector):
                  depth_model_type = 'depth_anything', # 'depth_anything' or 'unidepth'
                  use_rope = False,
                  depth_skip = False, # if True, encode the predicted depth map with the vision encoder and add the resulting tokens (with the same 3D PE) as extra vision tokens (depth skip connection)
+                 depth_skip_mode = 'concat', # 'concat' -> append depth tokens as extra vision tokens; 'add' -> add depth tokens element-wise onto the RGB vision tokens (no extra tokens)
                  ):
         
         super(SpaceDrive, self).__init__(train_cfg, test_cfg,)
@@ -110,6 +111,7 @@ class SpaceDrive(MVXTwoStageDetector):
 
         # depth skip connection
         self.depth_skip = depth_skip
+        self.depth_skip_mode = depth_skip_mode
 
         # paths
         self.save_path = save_path
@@ -427,16 +429,19 @@ class SpaceDrive(MVXTwoStageDetector):
         return coords_position_embeding, coords3d
 
     ############### Depth skip connection ###############
-    def build_depth_skip_feature(self, depth, img, pos_embed):
+    def build_depth_skip_feature(self, depth, img, pos_embed, add_pe=True):
         '''
         Depth skip connection: encode the predicted depth map with the (frozen) Qwen
-        vision encoder, pass it through a small trainable adapter, and add the SAME
-        3D positional encoding used for the RGB vision tokens. The returned tokens are
-        appended as extra vision tokens.
+        vision encoder, pass it through a small trainable adapter, and (optionally) add
+        the SAME 3D positional encoding used for the RGB vision tokens.
+        In 'concat' mode the returned tokens are appended as extra vision tokens (add_pe=True).
+        In 'add' mode they are added element-wise onto the RGB tokens, which already receive
+        the 3D PE inside the LLM, so here add_pe=False to avoid double-counting the PE.
         Args:
             depth: torch.Tensor (B, num_views, Hd, Wd), predicted metric depth
             img: torch.Tensor (B, num_views, C, H, W), used only to get the target size
             pos_embed: torch.Tensor (B, N_tokens, hidden), the 3D PE of the RGB vision tokens
+            add_pe: bool, whether to add the 3D PE onto the depth tokens
         Returns:
             depth_feature: torch.Tensor (B, N_tokens, hidden)
         '''
@@ -474,9 +479,9 @@ class SpaceDrive(MVXTwoStageDetector):
         # trainable residual adapter on top of the frozen depth features
         depth_embeds = depth_embeds + self.depth_adapter(depth_embeds.to(self.depth_adapter[0].weight.dtype)).to(depth_embeds.dtype)
 
-        # add the SAME 3D positional encoding as the RGB vision tokens
+        # add the SAME 3D positional encoding as the RGB vision tokens (concat mode only)
         pos_embed_flat = pos_embed.reshape(-1, pos_embed.shape[-1]).to(depth_embeds.device, depth_embeds.dtype)
-        if pos_embed_flat.shape[0] == depth_embeds.shape[0]:
+        if add_pe and pos_embed_flat.shape[0] == depth_embeds.shape[0]:
             depth_embeds = depth_embeds + pos_embed_flat
 
         depth_feature = depth_embeds.reshape(B, -1, depth_embeds.shape[-1])  # (B, N_tokens, hidden)
@@ -677,39 +682,46 @@ class SpaceDrive(MVXTwoStageDetector):
             has_gt_planning = data.get('has_gt_planning', None)
 
 
-        # depth skip connection: encode the predicted depth map and append the resulting
-        # tokens (with the same 3D PE as the RGB vision tokens) as extra vision tokens.
+        # depth skip connection: encode the predicted depth map and either (concat) append
+        # the resulting tokens as extra vision tokens, or (add) add them element-wise onto
+        # the RGB vision tokens. Both carry the same 3D PE as the RGB vision tokens.
         ego_feature = None
+        depth_add_feature = None
         if self.depth_skip and pos_embed is not None:
-            ego_feature = torch.empty(B, 0, self.llm_hidden_dim, device=pos_embed.device)
-            depth_feature = self.build_depth_skip_feature(depth, data['img'], pos_embed)  # (B, n_depth, hidden)
-            n_depth = depth_feature.shape[1]
+            if self.depth_skip_mode == 'add':
+                # 'add' mode: no extra tokens; add_pe=False because the RGB tokens (onto which
+                # this is added inside the LLM) already receive the 3D PE.
+                depth_add_feature = self.build_depth_skip_feature(depth, data['img'], pos_embed, add_pe=False)
+            else:
+                ego_feature = torch.empty(B, 0, self.llm_hidden_dim, device=pos_embed.device)
+                depth_feature = self.build_depth_skip_feature(depth, data['img'], pos_embed, add_pe=True)  # (B, n_depth, hidden)
+                n_depth = depth_feature.shape[1]
 
-            if input_ids is not None:
-                if (input_ids[0] == VISION_END_TOKEN_INDEX).sum() == 0:  # llava
-                    last_vision_end_token = (input_ids[0] == IMAGE_TOKEN_INDEX).nonzero().max()
-                else:
-                    last_vision_end_token = (input_ids[0] == VISION_END_TOKEN_INDEX).nonzero().max()
+                if input_ids is not None:
+                    if (input_ids[0] == VISION_END_TOKEN_INDEX).sum() == 0:  # llava
+                        last_vision_end_token = (input_ids[0] == IMAGE_TOKEN_INDEX).nonzero().max()
+                    else:
+                        last_vision_end_token = (input_ids[0] == VISION_END_TOKEN_INDEX).nonzero().max()
 
-                # Insert depth tokens as bare image placeholders (NOT preceded by a
-                # <vision_start>), so get_rope_index counts the same number of vision
-                # blocks as the baseline (depth tokens carry their geometry via the added
-                # 3D PE, not via rope). A trailing <vision_end> (qwen) makes the ego-status
-                # tokens get inserted AFTER the depth tokens, keeping feature/placeholder
-                # order consistent (rgb, depth, ego, ego-PE).
-                if self.lm_type == 'llava':
-                    insert_ids_list = [IMAGE_TOKEN_INDEX] * n_depth
-                else:
-                    insert_ids_list = [IMAGE_TOKEN_INDEX] * n_depth + [VISION_END_TOKEN_INDEX]
-                insert_input_ids = torch.tensor(insert_ids_list, device=input_ids.device).unsqueeze(0).repeat(B, 1)
-                insert_labels = torch.tensor([IGNORE_INDEX] * len(insert_ids_list), device=vlm_labels.device).unsqueeze(0).repeat(B, 1)
-                insert_attn_mask = torch.tensor([1] * len(insert_ids_list), device=vlm_attn_mask.device).unsqueeze(0).repeat(B, 1)
+                    # Insert depth tokens as bare image placeholders (NOT preceded by a
+                    # <vision_start>), so get_rope_index counts the same number of vision
+                    # blocks as the baseline (depth tokens carry their geometry via the added
+                    # 3D PE, not via rope). A trailing <vision_end> (qwen) makes the ego-status
+                    # tokens get inserted AFTER the depth tokens, keeping feature/placeholder
+                    # order consistent (rgb, depth, ego, ego-PE).
+                    if self.lm_type == 'llava':
+                        insert_ids_list = [IMAGE_TOKEN_INDEX] * n_depth
+                    else:
+                        insert_ids_list = [IMAGE_TOKEN_INDEX] * n_depth + [VISION_END_TOKEN_INDEX]
+                    insert_input_ids = torch.tensor(insert_ids_list, device=input_ids.device).unsqueeze(0).repeat(B, 1)
+                    insert_labels = torch.tensor([IGNORE_INDEX] * len(insert_ids_list), device=vlm_labels.device).unsqueeze(0).repeat(B, 1)
+                    insert_attn_mask = torch.tensor([1] * len(insert_ids_list), device=vlm_attn_mask.device).unsqueeze(0).repeat(B, 1)
 
-                input_ids = torch.cat([input_ids[:, :last_vision_end_token+1], insert_input_ids, input_ids[:, last_vision_end_token+1:]], dim=-1)
-                vlm_labels = torch.cat([vlm_labels[:, :last_vision_end_token+1], insert_labels, vlm_labels[:, last_vision_end_token+1:]], dim=-1)
-                vlm_attn_mask = torch.cat([vlm_attn_mask[:, :last_vision_end_token+1], insert_attn_mask, vlm_attn_mask[:, last_vision_end_token+1:]], dim=-1)
+                    input_ids = torch.cat([input_ids[:, :last_vision_end_token+1], insert_input_ids, input_ids[:, last_vision_end_token+1:]], dim=-1)
+                    vlm_labels = torch.cat([vlm_labels[:, :last_vision_end_token+1], insert_labels, vlm_labels[:, last_vision_end_token+1:]], dim=-1)
+                    vlm_attn_mask = torch.cat([vlm_attn_mask[:, :last_vision_end_token+1], insert_attn_mask, vlm_attn_mask[:, last_vision_end_token+1:]], dim=-1)
 
-            ego_feature = torch.cat([ego_feature, depth_feature.to(ego_feature.dtype)], dim=1)
+                ego_feature = torch.cat([ego_feature, depth_feature.to(ego_feature.dtype)], dim=1)
 
         if self.ego_status is not None:
             rec_can_bus = torch.cat([data['command'].unsqueeze(-1), data['can_bus']], dim=-1)
@@ -788,6 +800,7 @@ class SpaceDrive(MVXTwoStageDetector):
                 ego_feature = ego_feature if (self.ego_status or self.depth_skip) and ego_feature is not None and ego_feature.numel() > 0  else None,
                 enable_pe_input = self.enable_pe_input if self.io_3d_pos else False,
                 pos_index = coords3d if self.use_rope else None,
+                depth_feature = depth_add_feature,
             )
 
             losses.update(vlm_loss=lm_loss['loss'])
@@ -890,30 +903,34 @@ class SpaceDrive(MVXTwoStageDetector):
             # no gradient for io_coords_pos
             io_coords_pos = io_coords_pos.detach()
     	
-        # depth skip connection (test): build extra depth vision tokens and insert placeholders
+        # depth skip connection (test): concat -> extra depth vision tokens; add -> element-wise add
         ego_feature = None
+        depth_add_feature = None
         if self.depth_skip and pos_embed is not None:
-            ego_feature = torch.empty(B, 0, self.llm_hidden_dim, device=pos_embed.device)
-            depth_feature = self.build_depth_skip_feature(depth, img, pos_embed)  # (B, n_depth, hidden)
-            n_depth = depth_feature.shape[1]
+            if self.depth_skip_mode == 'add':
+                depth_add_feature = self.build_depth_skip_feature(depth, img, pos_embed, add_pe=False)
+            else:
+                ego_feature = torch.empty(B, 0, self.llm_hidden_dim, device=pos_embed.device)
+                depth_feature = self.build_depth_skip_feature(depth, img, pos_embed, add_pe=True)  # (B, n_depth, hidden)
+                n_depth = depth_feature.shape[1]
 
-            if input_ids is not None:
-                if (input_ids[0] == VISION_END_TOKEN_INDEX).sum() == 0:  # llava
-                    last_vision_end_token = (input_ids[0] == IMAGE_TOKEN_INDEX).nonzero().max()
-                else:
-                    last_vision_end_token = (input_ids[0] == VISION_END_TOKEN_INDEX).nonzero().max()
+                if input_ids is not None:
+                    if (input_ids[0] == VISION_END_TOKEN_INDEX).sum() == 0:  # llava
+                        last_vision_end_token = (input_ids[0] == IMAGE_TOKEN_INDEX).nonzero().max()
+                    else:
+                        last_vision_end_token = (input_ids[0] == VISION_END_TOKEN_INDEX).nonzero().max()
 
-                if 'llava' in self.lm_path:
-                    insert_ids_list = [IMAGE_TOKEN_INDEX] * n_depth
-                else:
-                    insert_ids_list = [IMAGE_TOKEN_INDEX] * n_depth + [VISION_END_TOKEN_INDEX]
-                insert_input_ids = torch.tensor(insert_ids_list, device=input_ids.device).unsqueeze(0)
-                insert_attn_mask = torch.tensor([1] * len(insert_ids_list), device=attention_mask.device).unsqueeze(0)
+                    if 'llava' in self.lm_path:
+                        insert_ids_list = [IMAGE_TOKEN_INDEX] * n_depth
+                    else:
+                        insert_ids_list = [IMAGE_TOKEN_INDEX] * n_depth + [VISION_END_TOKEN_INDEX]
+                    insert_input_ids = torch.tensor(insert_ids_list, device=input_ids.device).unsqueeze(0)
+                    insert_attn_mask = torch.tensor([1] * len(insert_ids_list), device=attention_mask.device).unsqueeze(0)
 
-                input_ids = torch.cat([input_ids[:, :last_vision_end_token+1], insert_input_ids, input_ids[:, last_vision_end_token+1:]], dim=-1)
-                attention_mask = torch.cat([attention_mask[:, :last_vision_end_token+1], insert_attn_mask, attention_mask[:, last_vision_end_token+1:]], dim=-1)
+                    input_ids = torch.cat([input_ids[:, :last_vision_end_token+1], insert_input_ids, input_ids[:, last_vision_end_token+1:]], dim=-1)
+                    attention_mask = torch.cat([attention_mask[:, :last_vision_end_token+1], insert_attn_mask, attention_mask[:, last_vision_end_token+1:]], dim=-1)
 
-            ego_feature = torch.cat([ego_feature, depth_feature.to(ego_feature.dtype)], dim=1)
+                ego_feature = torch.cat([ego_feature, depth_feature.to(ego_feature.dtype)], dim=1)
 
         if self.ego_status is not None:
             rec_can_bus = torch.cat([data['command'].unsqueeze(-1), data['can_bus']], dim=-1)
@@ -989,6 +1006,7 @@ class SpaceDrive(MVXTwoStageDetector):
                         ego_feature = ego_feature if (self.ego_status or self.depth_skip) and ego_feature is not None and ego_feature.numel() > 0  else None,
                         enable_pe_input = self.enable_pe_input if self.io_3d_pos else False,
                         pos_index = coords3d if self.use_rope else None,
+                        depth_feature = depth_add_feature,
                         coords_encoder = self.position_encoder_mlp if (not self.single_token_output and self.pe_decode_method is not None and 'mlp' in self.pe_decode_method and self.input_pe_mlp) else self.position_encoder,
                         coords_decoder = self.mlp_output_coords  if  (not self.single_token_output and self.pe_decode_method is not None  and 'mlp' in self.pe_decode_method and not self.use_vae_to_replace_mlp) else  (self.vae_output_coords if self.use_vae_to_replace_mlp else None),
                         ## output args
@@ -1021,6 +1039,7 @@ class SpaceDrive(MVXTwoStageDetector):
                         enable_pe_input = self.enable_pe_input if self.io_3d_pos else False,
                         coords_encoder = self.position_encoder_mlp if (not self.single_token_output and self.pe_decode_method is not None and 'mlp' in self.pe_decode_method and self.input_pe_mlp) else self.position_encoder,
                         coords_decoder = self.mlp_output_coords  if  (not self.single_token_output and self.pe_decode_method is not None  and 'mlp' in self.pe_decode_method and not self.use_vae_to_replace_mlp) else  (self.vae_output_coords if self.use_vae_to_replace_mlp else None),
+                        depth_feature = depth_add_feature,
                         ## output args
                         output_hidden_states=True,
                         return_dict_in_generate=True,

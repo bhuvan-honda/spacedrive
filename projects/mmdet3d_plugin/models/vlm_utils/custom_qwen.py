@@ -105,6 +105,7 @@ class CustomQwen2_5_VLForConditionalGeneration(Qwen2_5_VLForConditionalGeneratio
         ego_feature: Optional[torch.Tensor] = None, # shape (B, 1, hidden)
         enable_pe_input = False, # enable the use of PE in autoregressive manner, if False, only use PE for supervision
         pos_index: Optional[torch.Tensor] = None,
+        depth_feature: Optional[torch.Tensor] = None, # depth skip 'add' mode: encoded depth tokens added onto the RGB image tokens
     ) -> Union[Tuple, Qwen2_5_VLCausalLMOutputWithPast]:
         r"""
         labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
@@ -225,6 +226,7 @@ class CustomQwen2_5_VLForConditionalGeneration(Qwen2_5_VLForConditionalGeneratio
             include_semantic_posemb = include_semantic_posemb,
             ego_feature = ego_feature,
             pos_index = pos_index,
+            depth_feature = depth_feature,
         )
 
         hidden_states = outputs[0] # Note: This is hidden states before the cls head
@@ -675,6 +677,7 @@ class CustomQwen2_5_VLModel(Qwen2_5_VLModel):
         ego_feature: Optional[torch.Tensor] = None,
         enable_pe_input: Optional[bool] = False,
         pos_index: Optional[torch.Tensor] = None,
+        depth_feature: Optional[torch.Tensor] = None,
     ) -> Union[Tuple, Qwen2_5_VLModelOutputWithPast]:
         r"""
         pixel_values_videos (`torch.FloatTensor` of shape `(seq_length, num_channels * temporal_size * image_size * image_size)):
@@ -753,7 +756,12 @@ class CustomQwen2_5_VLModel(Qwen2_5_VLModel):
                     )
                 image_embeds = image_embeds + pos_emb # shape [B, N, C]
                 
-                
+            # NOTE: depth skip 'add' mode: add the (adapter-encoded) depth tokens
+            # directly onto the RGB image tokens (same positions), so each vision token
+            # becomes visual + depth (+ pos_emb already added above).
+            if depth_feature is not None:
+                depth_feature = depth_feature.reshape(image_embeds.shape).to(image_embeds.device, image_embeds.dtype)
+                image_embeds = image_embeds + depth_feature
 
             # NOTE: HERE starts the ego feature insertion
             if ego_feature is not None:
