@@ -13,7 +13,7 @@ class_names = [
 ]
 
 ############### Training config ###############
-num_gpus = 8
+num_gpus = 4
 batch_size = 1
 num_epochs = 6 
 num_iters_per_epoch = 28130 // (num_gpus * batch_size)

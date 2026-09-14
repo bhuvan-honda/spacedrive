@@ -477,7 +477,8 @@ class SpaceDrive(MVXTwoStageDetector):
         depth_embeds = inner_model.get_image_features(depth_pixel_values, depth_grid_thw)  # (N_tokens, hidden)
 
         # trainable residual adapter on top of the frozen depth features
-        depth_embeds = depth_embeds + self.depth_adapter(depth_embeds.to(self.depth_adapter[0].weight.dtype)).to(depth_embeds.dtype)
+        # depth_embeds = depth_embeds + self.depth_adapter(depth_embeds.to(self.depth_adapter[0].weight.dtype)).to(depth_embeds.dtype)
+        depth_embeds = self.depth_adapter(depth_embeds.to(self.depth_adapter[0].weight.dtype)).to(depth_embeds.dtype)
 
         # add the SAME 3D positional encoding as the RGB vision tokens (concat mode only)
         pos_embed_flat = pos_embed.reshape(-1, pos_embed.shape[-1]).to(depth_embeds.device, depth_embeds.dtype)

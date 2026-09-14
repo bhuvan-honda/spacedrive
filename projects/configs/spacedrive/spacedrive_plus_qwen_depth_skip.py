@@ -11,10 +11,10 @@ _base_ = ['./spacedrive_plus_qwen.py']
 depth_skip = True
 # 'concat' -> append depth tokens as extra vision tokens
 # 'add'    -> add depth tokens element-wise onto the RGB vision tokens (no extra tokens)
-depth_skip_mode = 'add'
+depth_skip_mode = 'concat'
 
 # separate work dir / result paths for this experiment
-base_path = '/workspace/results/spacedrive_plus_qwen_depth_skip_add/'
+base_path = '/workspace/results/spacedrive_plus_qwen_depth_skip_concat_v2/'
 work_dir = base_path
 results_path = base_path + '_results_planning_only/'
 wb_run_name = base_path + 'depth_skip_run'
