@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(docker exec *)",
+      "Bash(docker cp *)",
+      "Bash(python3 -c \"print\\(1\\)\")"
+    ]
+  }
+}

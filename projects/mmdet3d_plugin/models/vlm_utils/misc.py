@@ -25,11 +25,13 @@ def make_row_mask_hook(allowed_row_indices):
         return grad
     return hook
 
-def load_model(base_model,tokenizer_path, use_lora, frozen, llm_lora_rank=16):
+def load_model(base_model,tokenizer_path, use_lora, frozen, llm_lora_rank=16, attn_implementation=None):
 
     if 'Qwen2.5' in base_model:
+        # attn_implementation=None keeps the transformers default (sdpa); 'flash_attention_2' needs the flash-attn image
+        extra = {} if attn_implementation is None else {'attn_implementation': attn_implementation}
         model = CustomQwen2_5_VLForConditionalGeneration.from_pretrained(
-            base_model, torch_dtype=torch.bfloat16, device_map= {'':torch.cuda.current_device()}, local_files_only=True, 
+            base_model, torch_dtype=torch.bfloat16, device_map= {'':torch.cuda.current_device()}, local_files_only=True, **extra,
         )
         model.gradient_checkpointing_enable()
     

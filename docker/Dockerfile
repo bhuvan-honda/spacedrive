@@ -44,7 +44,7 @@ RUN set -ex && \
 # Set python3.9 as default
 RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.9 1 \
     && update-alternatives --install /usr/bin/python python /usr/bin/python3.9 1 \
-    && curl -sS https://bootstrap.pypa.io/get-pip.py | python3.9
+    && curl -sS https://bootstrap.pypa.io/pip/3.9/get-pip.py | python3.9
 
 # Install pytorch
 RUN pip install --no-cache-dir torch==2.1.1 torchvision==0.16.1 torchaudio==2.1.1 \
@@ -69,12 +69,17 @@ RUN pip install mmdet==${MMDET}
 
 RUN pip install mmsegmentation==${MMSEG}
 
+# Pre-install grpcio from a prebuilt wheel to avoid a source build
+# (source builds fail on this toolchain with "SSE2 not enabled on linux-x86_64")
+RUN pip install --only-binary=:all: grpcio
+
 RUN cd /deps \
     && git clone https://github.com/open-mmlab/mmdetection3d.git \
     && cd mmdetection3d \
     && git checkout tags/v${MMDET3D} \
-    && pip install "numpy<2.0.0" "scikit-image<0.20" "scikit-learn<1.3" "pandas<2.0.0" "opencv-python<4.9.0" "opencv-python-headless<4.9.0" \
-    && python3.9 setup.py develop
+    && pip install "numpy<2.0.0" "scikit-image<0.20" "scikit-learn<1.3" "pandas<2.0.0" "opencv-python<4.9.0" "opencv-python-headless<4.9.0" "plyfile<1.1" \
+       -r requirements/runtime.txt \
+    && python3.9 setup.py develop --no-deps
 
 # Install unidepth_py3.9
 RUN git clone https://github.com/zhenghao2519/UniDepth_py39 \

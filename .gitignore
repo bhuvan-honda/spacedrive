@@ -15,7 +15,7 @@ workspace
 *.log
 *.pyc
 
-**results**
+# **results**
 spacedrive_plus_qwen/
 spacedrive_plus_qwen_new_train/
 spacedrive_qwen/
@@ -26,3 +26,5 @@ infer_*/
 *.txt
 logs/
 results/
+yui*
+Qwen*

@@ -50,6 +50,7 @@ class CustomQwen2_5_VLCausalLMOutputWithPast(Qwen2_5_VLCausalLMOutputWithPast):
     gt_coords_xy: Optional[torch.FloatTensor] = None  # Ground truth coordinates in xy plane
     last_hidden_state: Optional[torch.FloatTensor] = None  # Last hidden state of the model
     last_hidden_state_original: Optional[torch.FloatTensor] = None  # Original last hidden state before any modifications
+    depth_orth_loss: Optional[torch.FloatTensor] = None  # soft orthogonality penalty between depth and appearance tokens
     labels: Optional[torch.LongTensor] = None  # Labels for the loss calculation
 
 
@@ -106,6 +107,9 @@ class CustomQwen2_5_VLForConditionalGeneration(Qwen2_5_VLForConditionalGeneratio
         enable_pe_input = False, # enable the use of PE in autoregressive manner, if False, only use PE for supervision
         pos_index: Optional[torch.Tensor] = None,
         depth_feature: Optional[torch.Tensor] = None, # depth skip 'add' mode: encoded depth tokens added onto the RGB image tokens
+        depth_orth_mode: str = 'none', # 'none' | 'hard' | 'soft': orthogonalise depth against appearance before adding
+        depth_scale: Optional[torch.Tensor] = None, # learnable scalar controlling depth magnitude in 'add' mode
+        vision_adapter = None, # optional callable (B*N*h*w, C) -> (B*N*h*w, C) applied to the camera vision tokens
     ) -> Union[Tuple, Qwen2_5_VLCausalLMOutputWithPast]:
         r"""
         labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
@@ -227,6 +231,9 @@ class CustomQwen2_5_VLForConditionalGeneration(Qwen2_5_VLForConditionalGeneratio
             ego_feature = ego_feature,
             pos_index = pos_index,
             depth_feature = depth_feature,
+            depth_orth_mode = depth_orth_mode,
+            depth_scale = depth_scale,
+            vision_adapter = vision_adapter,
         )
 
         hidden_states = outputs[0] # Note: This is hidden states before the cls head
@@ -264,11 +271,15 @@ class CustomQwen2_5_VLForConditionalGeneration(Qwen2_5_VLForConditionalGeneratio
             # select the ground truth pos from io_coords_pos
             gt_pos = io_coords_pos.masked_select(io_coords_pos_mask & output_mask).view(-1, io_coords_pos.shape[-1])
 
+            # (B, L) mask of answer coords. output_pos / gt_pos / gt_coords_xy are flattened over the
+            # batch in this (batch-major) order; samples may hold different numbers of coords when B > 1.
+            answer_coords_mask = io_coords_pos_mask.squeeze(-1) & (labels != IGNORE_INDEX)
+
             if gt_coords_xy != None: 
                 output_xy_mask = output_mask.masked_select(io_coords_pos_mask).view( -1, hidden_states.shape[-1]) # shape (bs, num_pos, hidden_states)
                 output_xy_mask = output_xy_mask[:,:2]
                 
-                gt_coords_xy = gt_coords_xy.masked_select(output_xy_mask).view(B, -1, gt_coords_xy.shape[-1]).to(gt_pos.dtype)
+                gt_coords_xy = gt_coords_xy.masked_select(output_xy_mask).view(-1, gt_coords_xy.shape[-1]).to(gt_pos.dtype) # (num_answer_coords, 2)
 
         loss = None
         if labels is not None:
@@ -291,17 +302,23 @@ class CustomQwen2_5_VLForConditionalGeneration(Qwen2_5_VLForConditionalGeneratio
                 num_valid = has_gt_planning.sum()
                 
                 if planning_only:
-                    # only select the first six coords for loss_pos calculation
+                    # only select the first six coords of every sample with gt planning for loss_pos calculation
                     if io_coords_pos is not None:
-                        output_pos = output_pos.reshape(num_valid, -1, self.llm_hidden_dim)[:, :6, :] # select the first six coords
-                        gt_pos = gt_pos.reshape(num_valid, -1, self.llm_hidden_dim)[:, :6, :] # select the first six coords
-                        gt_coords_xy = gt_coords_xy.reshape(num_valid, -1, 2)[:, :6, :] # select the first six coords
+                        rank = answer_coords_mask.cumsum(-1)[answer_coords_mask] # 1-based index of each answer coord within its sample
+                        sample_idx = answer_coords_mask.nonzero(as_tuple=True)[0]
+                        keep = (rank <= 6) & has_gt_planning.view(-1).bool().to(sample_idx.device)[sample_idx]
+                        output_pos = output_pos[keep].reshape(num_valid, 6, self.llm_hidden_dim)
+                        gt_pos = gt_pos[keep].reshape(num_valid, 6, self.llm_hidden_dim)
+                        gt_coords_xy = gt_coords_xy[keep].reshape(num_valid, 6, 2)
                 elif single_coords_only:
                     # only select the first coords for loss_pos calculation
                     if io_coords_pos is not None: # NOTE: make sure it also has at least one coords
                         output_pos = output_pos.reshape(num_valid, -1, self.llm_hidden_dim)[:, :1, :].unsqueeze(1) # select the first coords
                         gt_pos = gt_pos.reshape(num_valid, -1, self.llm_hidden_dim)[:, :1, :].unsqueeze(1) # select the first coords
                         gt_coords_xy = gt_coords_xy.reshape(num_valid, -1, 2)[:, :6, :] # select the first six coords
+                elif gt_coords_xy is not None:
+                    # all answer coords, flattened over the batch; matches output_pos, which forward_train_vlm unsqueezes to (1, N, hidden)
+                    gt_coords_xy = gt_coords_xy.unsqueeze(0)
 
             
             loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size , weight=weighted_mask, num_items_in_batch=torch.tensor(B))
@@ -392,7 +409,8 @@ class CustomQwen2_5_VLForConditionalGeneration(Qwen2_5_VLForConditionalGeneratio
                 gt_pos=gt_pos,
                 output_pe_mask=output_pe_mask,
                 gt_coords_xy=gt_coords_xy,
-                labels = labels
+                labels = labels,
+                depth_orth_loss=getattr(self.model, 'last_depth_orth_loss', None),
             )
         return CustomQwen2_5_VLCausalLMOutputWithPast(  # NOTE: This is used for test Inference
             loss=loss,
@@ -402,7 +420,8 @@ class CustomQwen2_5_VLForConditionalGeneration(Qwen2_5_VLForConditionalGeneratio
             attentions=outputs.attentions,
             rope_deltas=outputs.rope_deltas,
             last_hidden_state=hidden_states,
-            last_hidden_state_original=hidden_states_original
+            last_hidden_state_original=hidden_states_original,
+            depth_orth_loss=getattr(self.model, 'last_depth_orth_loss', None),
         )
     
 
@@ -651,6 +670,21 @@ class CustomQwen2_5_VLModel(Qwen2_5_VLModel):
         super().__init__(config)
         self.rope_3d = RoPE3D(config.text_config.hidden_size)
 
+    def get_image_features(self, pixel_values: torch.FloatTensor, image_grid_thw: Optional[torch.LongTensor] = None):
+        # Encode one image per call. Without flash-attn, the vision attention (eager/sdpa) builds a dense
+        # (total_patches x total_patches) block-diagonal mask over ALL images in the call, so cost and memory
+        # grow quadratically with the number of images (B * 6 views). Attention never crosses images, so
+        # per-image calls are mathematically identical (verified fp32) and ~4x faster at B=4 (24 images).
+        pixel_values = pixel_values.type(self.visual.dtype)
+        if self.visual.config._attn_implementation == "flash_attention_2":
+            # flash-attn uses varlen kernels with cu_seqlens (no dense mask), so one batched call is best
+            return self.visual(pixel_values, grid_thw=image_grid_thw)
+        sizes = image_grid_thw.prod(-1).tolist()
+        return torch.cat([
+            self.visual(pv, grid_thw=thw.unsqueeze(0))
+            for pv, thw in zip(pixel_values.split(sizes), image_grid_thw)
+        ], dim=0)
+
     @auto_docstring
     def forward(
         self,
@@ -678,6 +712,9 @@ class CustomQwen2_5_VLModel(Qwen2_5_VLModel):
         enable_pe_input: Optional[bool] = False,
         pos_index: Optional[torch.Tensor] = None,
         depth_feature: Optional[torch.Tensor] = None,
+        depth_orth_mode: str = 'none',
+        depth_scale: Optional[torch.Tensor] = None,
+        vision_adapter = None,
     ) -> Union[Tuple, Qwen2_5_VLModelOutputWithPast]:
         r"""
         pixel_values_videos (`torch.FloatTensor` of shape `(seq_length, num_channels * temporal_size * image_size * image_size)):
@@ -726,6 +763,9 @@ class CustomQwen2_5_VLModel(Qwen2_5_VLModel):
 
         if pixel_values is not None:
             image_embeds = self.get_image_features(pixel_values, image_grid_thw)
+            # pure appearance reference (before pos_emb / depth are added), used as the
+            # stop-grad target for orthogonal depth fusion in 'add' mode.
+            image_embeds_pure = image_embeds
             n_image_tokens = (input_ids == self.config.image_token_id).sum().item()
             n_image_features = image_embeds.shape[0]
             if n_image_tokens != n_image_features and ego_feature is None:
@@ -759,9 +799,29 @@ class CustomQwen2_5_VLModel(Qwen2_5_VLModel):
             # NOTE: depth skip 'add' mode: add the (adapter-encoded) depth tokens
             # directly onto the RGB image tokens (same positions), so each vision token
             # becomes visual + depth (+ pos_emb already added above).
+            self.last_depth_orth_loss = None
             if depth_feature is not None:
                 depth_feature = depth_feature.reshape(image_embeds.shape).to(image_embeds.device, image_embeds.dtype)
-                image_embeds = image_embeds + depth_feature
+                if depth_orth_mode in ('hard', 'soft'):
+                    # appearance reference = the pure visual token BEFORE pos_emb was added
+                    # (stop-grad, so the projection/penalty only moves the depth branch).
+                    ref = image_embeds_pure.detach()
+                    if depth_orth_mode == 'hard':
+                        # remove the appearance-aligned component of depth (per-token
+                        # Gram-Schmidt): keep only what appearance cannot already explain.
+                        dot = (depth_feature * ref).sum(dim=-1, keepdim=True)
+                        denom = (ref * ref).sum(dim=-1, keepdim=True).clamp_min(1e-6)
+                        depth_feature = depth_feature - (dot / denom) * ref
+                    else:  # 'soft'
+                        cos = torch.nn.functional.cosine_similarity(
+                            depth_feature.float(), ref.float(), dim=-1)
+                        self.last_depth_orth_loss = (cos ** 2).mean()
+                scale = depth_scale.to(image_embeds.dtype) if depth_scale is not None else 1.0
+                image_embeds = image_embeds + scale * depth_feature
+
+            # optional cross-view adapter on the (appearance + 3D PE + depth) camera tokens
+            if vision_adapter is not None:
+                image_embeds = vision_adapter(image_embeds)
 
             # NOTE: HERE starts the ego feature insertion
             if ego_feature is not None:

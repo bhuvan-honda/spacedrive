@@ -552,7 +552,7 @@ class LoadAnnoatationVQA():
             print(f"Using llm_type: {self.llm_type}")
 
         if 'qwen' in self.llm_type:
-            self.processor = AutoProcessor.from_pretrained(processor, model_max_length=max_length)
+            self.processor = AutoProcessor.from_pretrained(processor, model_max_length=max_length, use_fast=False)
             if tokenizer is not None:
                 self.tokenizer = AutoTokenizer.from_pretrained(tokenizer,
                                                 )
@@ -1171,7 +1171,7 @@ class LoadAnnoatationVQATest():
         self.num_commands=num_commands
 
         self.load_3d_pos = load_3d_pos
-        self.processor = AutoProcessor.from_pretrained(processor, model_max_length=max_length)
+        self.processor = AutoProcessor.from_pretrained(processor, model_max_length=max_length, use_fast=False)
         if tokenizer is not None:
             self.tokenizer = AutoTokenizer.from_pretrained(tokenizer,
                                             )
@@ -1213,7 +1213,7 @@ class LoadAnnoatationVQATest():
             print(f"Using llm_type: {self.llm_type}")
 
         if 'qwen' in self.llm_type:
-            self.processor = AutoProcessor.from_pretrained(processor, model_max_length=max_length)
+            self.processor = AutoProcessor.from_pretrained(processor, model_max_length=max_length, use_fast=False)
             if tokenizer is not None:
                 self.tokenizer = AutoTokenizer.from_pretrained(tokenizer,
                                                 )

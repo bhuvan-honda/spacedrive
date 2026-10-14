@@ -14,10 +14,23 @@ class_names = [
 
 ############### Training config ###############
 num_gpus = 4
-batch_size = 1
-num_epochs = 6 
-num_iters_per_epoch = 28130 // (num_gpus * batch_size)
-lr = 1e-4 /2 * batch_size / 8 * num_gpus
+batch_size = 8 # per GPU
+num_epochs = 6
+total_batch_size = num_gpus * batch_size
+num_iters_per_epoch = 28130 // total_batch_size
+# AdamW hyper-parameters are scaled from the reference setup (8 GPUs x bs 1: lr 5e-5, betas (0.9, 0.999),
+# 500 warmup iters), so a given number of epochs converges similarly for any num_gpus / batch_size:
+#  - lr: square-root rule for adaptive optimizers (Malladi et al. 2022) instead of the linear rule for SGD
+#  - beta2: keep the second-moment EMA horizon fixed in samples (0.999 -> 0.999 ** k)
+#  - warmup: a fixed number of samples (4000) instead of a fixed number of iterations
+# For total_batch_size == 8 these reduce exactly to the reference values.
+ref_batch_size = 8
+ref_lr = 5e-5
+ref_warmup_iters = 500
+batch_scale = total_batch_size / ref_batch_size
+lr = ref_lr * batch_scale ** 0.5
+adam_betas = (0.9, 0.999 ** batch_scale)
+warmup_iters = max(1, round(ref_warmup_iters / batch_scale))
 
 ############### SpaceDrive Config ###############
 vis_3d_pos = True # enable PE on vision tokens
@@ -219,7 +232,7 @@ test_pipeline = [
 
 data = dict(
     samples_per_gpu=batch_size,
-    workers_per_gpu=8,
+    workers_per_gpu=6,
     train=dict(
         type=dataset_type,
         data_root=data_root,
@@ -258,7 +271,7 @@ data = dict(
 
 
 optimizer = dict(constructor='LearningRateDecayOptimizerConstructor', type='AdamW', 
-                 lr=lr, betas=(0.9, 0.999), weight_decay=1e-4, 
+                 lr=lr, betas=adam_betas, weight_decay=1e-4, 
 
                  paramwise_cfg={'decay_rate': 0.9,
                                 'head_decay_rate': 4.0,
@@ -272,7 +285,7 @@ optimizer_config = dict(type='Fp16OptimizerHook', loss_scale='dynamic', grad_cli
 lr_config = dict(
     policy='CosineAnnealing',
     warmup='linear',
-    warmup_iters=500,
+    warmup_iters=warmup_iters,
     warmup_ratio=1.0 / 3,
     min_lr_ratio=1e-3,
     )

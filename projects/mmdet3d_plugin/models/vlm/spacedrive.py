@@ -32,9 +32,16 @@ from ...datasets.utils.constants import IGNORE_INDEX , IMAGE_TOKEN_INDEX, VISION
 from ..vlm_utils.misc import load_model, locations
 from ..vlm_utils.positional_encoding import PositionalEncoding3D
 from ..vlm_utils.distributions import  VAEPEDecoder
+from ..vlm_utils.custom_qwen import CustomQwen2_5_VLModel
+from ..vlm_utils.bev_occ_head import BEVOccHead, load_bev_occ_targets
+from ..vlm_utils.film import DepthFiLM
+from ..vlm_utils.epipolar_adapter import DepthEpipolarAdapter
+from ..vlm_utils.geometry import token_rays, vis_token_mask
+from functools import partial
 
 # Unidepth imports
 from unidepth.models import UniDepthV2
+from unidepth.models.unidepthv2.unidepthv2 import get_paddings
 from unidepth.utils.camera import Pinhole
 
 
@@ -79,6 +86,15 @@ class SpaceDrive(MVXTwoStageDetector):
                  use_rope = False,
                  depth_skip = False, # if True, encode the predicted depth map with the vision encoder and add the resulting tokens (with the same 3D PE) as extra vision tokens (depth skip connection)
                  depth_skip_mode = 'concat', # 'concat' -> append depth tokens as extra vision tokens; 'add' -> add depth tokens element-wise onto the RGB vision tokens (no extra tokens)
+                 depth_orth_mode = 'none', # ('add' mode only) 'none' -> plain add; 'hard' -> project depth orthogonal to the appearance token before adding; 'soft' -> add a cos^2 orthogonality penalty
+                 depth_orth_lambda = 1.0, # weight of the soft orthogonality penalty
+                 depth_scale_init = 1.0, # initial value of the learnable per-model depth magnitude scalar ('add' mode)
+                 depth_real_intrinsics = False, # (unidepth) if True, condition UniDepth on the GT camera intrinsics instead of letting it self-estimate them
+                 depth_skip_gpu_preprocess = False, # if True, run the depth-skip image preprocessing (resize/normalize/patchify) on the GPU instead of the CPU HF image processor
+                 attn_implementation = None, # None -> transformers default (sdpa); 'flash_attention_2' requires the spacedrive:v1.0-flashattn image
+                 bev_occ = None, # dict -> auxiliary BEV occupancy head on LLM vision-token hidden states (BEVOccHead kwargs), training only
+                 depth_film = None, # dict -> FiLM of vision tokens in intermediate LLM layers on UniDepth features (DepthFiLM kwargs)
+                 epipolar = None, # dict -> depth-guided epipolar cross-view adapter on the vision tokens (DepthEpipolarAdapter kwargs)
                  ):
         
         super(SpaceDrive, self).__init__(train_cfg, test_cfg,)
@@ -112,6 +128,10 @@ class SpaceDrive(MVXTwoStageDetector):
         # depth skip connection
         self.depth_skip = depth_skip
         self.depth_skip_mode = depth_skip_mode
+        self.depth_orth_mode = depth_orth_mode
+        self.depth_orth_lambda = depth_orth_lambda
+        self.depth_real_intrinsics = depth_real_intrinsics
+        self.depth_skip_gpu_preprocess = depth_skip_gpu_preprocess
 
         # paths
         self.save_path = save_path
@@ -124,7 +144,8 @@ class SpaceDrive(MVXTwoStageDetector):
 
         # vlm init
         if processor is not None:
-            self.processor = AutoProcessor.from_pretrained(processor)
+            # use_fast=False: keep the slow (PIL) image processor all checkpoints were trained with
+            self.processor = AutoProcessor.from_pretrained(processor, use_fast=False)
             self.merge_size = self.processor.image_processor.merge_size if hasattr(self.processor.image_processor, 'merge_size') else 1
 
         if tokenizer is not None:
@@ -136,7 +157,7 @@ class SpaceDrive(MVXTwoStageDetector):
 
         self.llm_hidden_dim = 4096
         if lm_head is not None:
-            self.lm_head = load_model(lm_head, tokenizer, use_lora, frozen, llm_lora_rank=llm_lora_rank )
+            self.lm_head = load_model(lm_head, tokenizer, use_lora, frozen, llm_lora_rank=llm_lora_rank, attn_implementation=attn_implementation)
             self.lm_head.base_model.model.tokenizer = self.tokenizer
             if 'llava' in lm_head:
                 self.llm_hidden_dim =4096
@@ -271,7 +292,77 @@ class SpaceDrive(MVXTwoStageDetector):
             )
             nn.init.zeros_(self.depth_adapter[-1].weight)
             nn.init.zeros_(self.depth_adapter[-1].bias)
+            # 'add' mode: a single learnable scalar controlling the overall depth magnitude
+            # relative to the appearance tokens. Pairs with the orthogonality prior: the
+            # projection fixes the *direction*, this scalar controls the *magnitude*.
+            if self.depth_skip_mode == 'add':
+                self.depth_scale = nn.Parameter(torch.tensor(float(depth_scale_init)))
 
+        # auxiliary BEV occupancy head (training only)
+        self.bev_occ_head = BEVOccHead(self.llm_hidden_dim, **bev_occ) if bev_occ is not None else None
+
+        # FiLM of the vision tokens inside selected LLM decoder layers, conditioned on UniDepth features
+        self.depth_film = None
+        if depth_film is not None:
+            assert self.vis_3d_pos and self.depth_model_type == 'unidepth', 'depth_film needs UniDepth'
+            cond_dim = self.depth_model.pixel_decoder.depth_layer.hidden_dim + 2  # latents + log depth + log conf
+            self.depth_film = DepthFiLM(cond_dim, self.llm_hidden_dim, **depth_film)
+            self.depth_film.attach(self._llm_decoder_layers())
+
+        # depth-guided epipolar cross-view adapter on the vision tokens
+        self.epipolar_adapter = None
+        if epipolar is not None:
+            assert self.vis_3d_pos, 'epipolar adapter needs the predicted depth'
+            self.epipolar_adapter = DepthEpipolarAdapter(self.llm_hidden_dim, **epipolar)
+
+    def _llm_decoder_layers(self):
+        for m in self.lm_head.modules():
+            if isinstance(m, CustomQwen2_5_VLModel):
+                return m.language_model.layers
+        raise RuntimeError('Qwen2.5-VL decoder layers not found')
+
+    def _token_grid(self, image_grid_thw):
+        return int(image_grid_thw[0, 0, 1]) // self.merge_size, int(image_grid_thw[0, 0, 2]) // self.merge_size
+
+    def _setup_geo_modules(self, depth, depth_aux, lidar2img, image_grid_thw, input_ids):
+        """Per LLM call: set the FiLM condition / vision-token mask and build the epipolar adapter closure.
+        depth (B, N, H, W) metric depth of the (H, W) input images. Returns the `vision_adapter` kwarg."""
+        if self.depth_film is None and self.epipolar_adapter is None:
+            return None
+        B, N, H, W = depth.shape
+        h, w = self._token_grid(image_grid_thw)
+        with torch.no_grad():
+            depth_tok = self.pool_downsample(depth.reshape(B * N, 1, H, W).float(), (h, w), 'min').reshape(B, N, h, w)
+        if self.depth_film is not None:
+            with torch.no_grad():
+                feats = torch.nn.functional.adaptive_avg_pool2d(depth_aux['features'].float(), (h, w))
+                conf = torch.nn.functional.adaptive_avg_pool2d(depth_aux['confidence'].float(), (h, w))
+                cond = torch.cat([feats, depth_tok.reshape(B * N, 1, h, w).clamp(min=0.5).log(),
+                                  conf.clamp(min=1e-3).log()], 1)
+                cond = cond.permute(0, 2, 3, 1).reshape(B * N * h * w, -1)  # (b, cam, i, j) = vision-token order
+            self.depth_film.set_state(cond, vis_token_mask(input_ids, IMAGE_TOKEN_INDEX, N * h * w))
+        if self.epipolar_adapter is not None:
+            return partial(self.epipolar_adapter, depth_tok=depth_tok, lidar2img=lidar2img, img_hw=(H, W))
+        return None
+
+    def _clear_geo_modules(self):
+        if self.depth_film is not None:
+            self.depth_film.clear()
+
+    def forward_bev_occ(self, hidden_states, input_ids, lidar2img, image_grid_thw, img_hw, img_metas):
+        """Auxiliary BEV occupancy loss on the vision-token hidden states entering LLM layer bev_occ_head.layer."""
+        head = self.bev_occ_head
+        B, N = lidar2img.shape[:2]
+        h, w = self._token_grid(image_grid_thw)
+        hs = hidden_states[head.layer]
+        tokens = hs[vis_token_mask(input_ids, IMAGE_TOKEN_INDEX, N * h * w)].view(B, N * h * w, -1)
+        if head.detach_input:
+            tokens = tokens.detach()
+        with torch.no_grad():
+            ray_dirs, _ = token_rays(lidar2img.float(), h, w, img_hw[0], img_hw[1])
+        logits = head(tokens, ray_dirs)
+        target, known = load_bev_occ_targets([m['sample_idx'] for m in img_metas], head.occ_root, head.out_size, logits.device)
+        return head.loss(logits, target, known)
 
 
     @property
@@ -290,11 +381,13 @@ class SpaceDrive(MVXTwoStageDetector):
         location = locations(x, self.stride, pad_h, pad_w)[None].repeat(bs*n, 1, 1, 1) # NOTE: stride must match the resolution from qwen_utils
         return location
 
-    def depth_prediction(self, img, intrinsics= None):
+    def depth_prediction(self, img, intrinsics= None, return_aux=False):
         '''
         predict the depth of multi_view image 
         Args:
             img: torch.Tensor (batch_size, num_views, H, W, 3) # (640, 640, 3)
+            return_aux: (unidepth) also return dict(features=(B*N, C, hf, wf) decoder latents with the UniDepth
+                padding cropped, confidence=(B*N, 1, h', w')), both covering the full input image
         Returns:
             depth: torch.Tensor (batch_size, num_views, H, W)
         '''
@@ -311,13 +404,32 @@ class SpaceDrive(MVXTwoStageDetector):
                 predicted_depth = outputs.predicted_depth
         elif self.depth_model_type == 'unidepth':
             rgb_torch = img.reshape(B*N, img.shape[-3], img.shape[-2], img.shape[-1]).to(self.depth_model.device)
-            intrinsics_torch = intrinsics[..., :3, :3].squeeze(0) # (B x num_views, 3, 3)
-            camera = Pinhole(K=intrinsics_torch)
-            predictions = self.depth_model.infer(rgb_torch)
-            predicted_depth = predictions["depth"]
+            if self.depth_real_intrinsics:
+                # ResizeMultiview3D(keep_ratio=False) stretches the images (non-square pixels, fx != fy),
+                # which UniDepth was not trained on. Undo the stretch along H so fx == fy, condition on the
+                # matching GT K, then resize the depth back (z is invariant to image resizing).
+                # clone: UniDepth's infer() crops/resizes the camera K in place.
+                K = intrinsics[..., :3, :3].reshape(-1, 3, 3).clone().float().to(self.depth_model.device) # (B * num_views, 3, 3)
+                sq_H = int(round(H * (K[:, 0, 0] / K[:, 1, 1]).mean().item()))
+                K[:, 1, :] *= sq_H / H
+                rgb_sq = torch.nn.functional.interpolate(rgb_torch.float(), size=(sq_H, W), mode='bilinear', align_corners=False)
+                predictions = self.depth_model.infer(rgb_sq, Pinhole(K=K))
+                predicted_depth = torch.nn.functional.interpolate(predictions["depth"].float(), size=(H, W), mode='bilinear', align_corners=False)
+                in_hw = (sq_H, W)
+            else:
+                predictions = self.depth_model.infer(rgb_torch)
+                predicted_depth = predictions["depth"]
+                in_hw = (H, W)
 
         depth = predicted_depth.view(B, N, predicted_depth.shape[-2], predicted_depth.shape[-1]).to(device)
-        return depth
+        if not return_aux:
+            return depth
+        assert self.depth_model_type == 'unidepth'
+        feats = predictions['depth_features']
+        (pl, pr, pt, pb), (pH, pW) = get_paddings(in_hw, self.depth_model.shape_constraints['ratio_bounds'])
+        hf, wf = feats.shape[-2:]
+        feats = feats[..., round(pt / pH * hf):hf - round(pb / pH * hf), round(pl / pW * wf):wf - round(pr / pW * wf)]
+        return depth, dict(features=feats.to(device), confidence=predictions['confidence'].to(device))
 
     def pool_downsample(self, img, output_size, mode='min'):
         '''
@@ -446,7 +558,9 @@ class SpaceDrive(MVXTwoStageDetector):
             depth_feature: torch.Tensor (B, N_tokens, hidden)
         '''
         B, N = depth.shape[0], depth.shape[1]
-        assert B == 1, 'depth_skip currently assumes batch_size==1 per GPU'
+        # NOTE: the body below is batch-general (per-view loop over B*N, reshape by B).
+        # Multi-batch streaming is provided by InfiniteGroupEachSampleInBatchSampler,
+        # which keeps one continuous temporal sequence per batch slot.
         H, W = img.shape[-2], img.shape[-1]
 
         # resize depth to the RGB input resolution so its grid matches the RGB grid
@@ -454,19 +568,22 @@ class SpaceDrive(MVXTwoStageDetector):
             depth.reshape(B * N, 1, depth.shape[-2], depth.shape[-1]).float(),
             size=(H, W), mode='bilinear', align_corners=False)  # (B*N, 1, H, W)
 
-        # per-view min-max normalise to [0, 255] and replicate to 3 channels (HWC uint8)
-        depth_imgs = []
-        for i in range(B * N):
-            d = depth_resized[i, 0]
-            d_min, d_max = d.min(), d.max()
-            d = (d - d_min) / (d_max - d_min + 1e-6)
-            d = (d * 255.0).clamp(0, 255).to(torch.uint8)
-            d = d.unsqueeze(-1).repeat(1, 1, 3)  # (H, W, 3)
-            depth_imgs.append(d.cpu().numpy())
+        if self.depth_skip_gpu_preprocess:
+            depth_pixel_values, depth_grid_thw = self._depth_to_qwen_patches_gpu(depth_resized[:, 0])
+        else:
+            # per-view min-max normalise to [0, 255] and replicate to 3 channels (HWC uint8)
+            depth_imgs = []
+            for i in range(B * N):
+                d = depth_resized[i, 0]
+                d_min, d_max = d.min(), d.max()
+                d = (d - d_min) / (d_max - d_min + 1e-6)
+                d = (d * 255.0).clamp(0, 255).to(torch.uint8)
+                d = d.unsqueeze(-1).repeat(1, 1, 3)  # (H, W, 3)
+                depth_imgs.append(d.cpu().numpy())
 
-        visual_processed = self.processor.image_processor(images=depth_imgs, return_tensors='pt')
-        depth_pixel_values = visual_processed['pixel_values']
-        depth_grid_thw = visual_processed['image_grid_thw']
+            visual_processed = self.processor.image_processor(images=depth_imgs, return_tensors='pt')
+            depth_pixel_values = visual_processed['pixel_values']
+            depth_grid_thw = visual_processed['image_grid_thw']
 
         # encode with the (frozen) Qwen vision encoder
         inner_model = self.lm_head.base_model.model.model
@@ -487,6 +604,47 @@ class SpaceDrive(MVXTwoStageDetector):
 
         depth_feature = depth_embeds.reshape(B, -1, depth_embeds.shape[-1])  # (B, N_tokens, hidden)
         return depth_feature
+
+    @torch.no_grad()
+    def _depth_to_qwen_patches_gpu(self, depth):
+        '''
+        GPU equivalent of the CPU path (per-view min-max -> uint8 -> HF Qwen2VLImageProcessor).
+        Antialiased bicubic in torch uses the same kernel as PIL bicubic, so outputs match up to
+        uint8 rounding of a few pixels.
+        Args:
+            depth: torch.Tensor (M, H, W) metric depth, one map per view
+        Returns:
+            pixel_values: (M * grid_h * grid_w, C * T * p * p) float32, grid_thw: (M, 3) long
+        '''
+        from transformers.models.qwen2_vl.image_processing_qwen2_vl import smart_resize
+        ip = self.processor.image_processor
+        M, H, W = depth.shape
+        p, m, T = ip.patch_size, ip.merge_size, ip.temporal_patch_size
+
+        d_min = depth.amin(dim=(1, 2), keepdim=True)
+        d_max = depth.amax(dim=(1, 2), keepdim=True)
+        d = ((depth - d_min) / (d_max - d_min + 1e-6) * 255.0).clamp(0, 255).to(torch.uint8)
+
+        rh, rw = smart_resize(H, W, factor=p * m, min_pixels=ip.size['shortest_edge'], max_pixels=ip.size['longest_edge'])
+        x = d.unsqueeze(1).float()
+        if (rh, rw) != (H, W):
+            # PIL resizes separably (horizontal then vertical) and rounds half-up to uint8 after each pass
+            if rw != W:
+                x = torch.nn.functional.interpolate(x, size=(H, rw), mode='bicubic', align_corners=False, antialias=True).add(0.5).floor().clamp(0, 255)
+            if rh != H:
+                x = torch.nn.functional.interpolate(x, size=(rh, rw), mode='bicubic', align_corners=False, antialias=True).add(0.5).floor().clamp(0, 255)
+
+        mean = torch.tensor(ip.image_mean, device=x.device, dtype=torch.float32).view(1, -1, 1, 1)
+        std = torch.tensor(ip.image_std, device=x.device, dtype=torch.float32).view(1, -1, 1, 1)
+        x = (x * ip.rescale_factor - mean) / std  # (M, C, rh, rw), grey replicated to C channels
+
+        C, gh, gw = x.shape[1], rh // p, rw // p
+        x = x.unsqueeze(1).expand(M, T, C, rh, rw)
+        x = x.reshape(M, T, C, gh // m, m, p, gw // m, m, p)
+        x = x.permute(0, 3, 6, 4, 7, 2, 1, 5, 8)
+        pixel_values = x.reshape(M * gh * gw, C * T * p * p)
+        grid_thw = torch.tensor([[1, gh, gw]], device=x.device, dtype=torch.long).expand(M, 3)
+        return pixel_values, grid_thw
 
     ############### Ego status ###############
     def reset_memory(self):
@@ -656,8 +814,12 @@ class SpaceDrive(MVXTwoStageDetector):
         B = pixel_values.shape[0]
         
         pos_embed = None
+        depth_aux = None
         if self.vis_3d_pos:
-            depth = self.depth_prediction(data['img'], data['intrinsics'])
+            if self.depth_film is not None:
+                depth, depth_aux = self.depth_prediction(data['img'], data['intrinsics'], return_aux=True)
+            else:
+                depth = self.depth_prediction(data['img'], data['intrinsics'])
 
             location = self.prepare_location(image_grid_thw, pixel_values)
 
@@ -782,6 +944,9 @@ class SpaceDrive(MVXTwoStageDetector):
    
         if self.with_lm_head:
 
+            # NOTE: the FiLM state is NOT cleared here: the reentrant gradient checkpointing re-runs the decoder
+            # layers (and their FiLM pre-hooks) during backward. The next _setup_geo_modules call overwrites it.
+            vision_adapter = self._setup_geo_modules(depth, depth_aux, data['lidar2img'], image_grid_thw, input_ids) if self.vis_3d_pos else None
             lm_loss = self.lm_head(
                 input_ids=input_ids, 
                 attention_mask=vlm_attn_mask,
@@ -802,9 +967,21 @@ class SpaceDrive(MVXTwoStageDetector):
                 enable_pe_input = self.enable_pe_input if self.io_3d_pos else False,
                 pos_index = coords3d if self.use_rope else None,
                 depth_feature = depth_add_feature,
+                depth_orth_mode = self.depth_orth_mode if (self.depth_skip and self.depth_skip_mode == 'add') else 'none',
+                depth_scale = self.depth_scale if (self.depth_skip and self.depth_skip_mode == 'add') else None,
+                vision_adapter = vision_adapter,
+                output_hidden_states = True if self.bev_occ_head is not None else None,
             )
 
             losses.update(vlm_loss=lm_loss['loss'])
+            if self.epipolar_adapter is not None:
+                losses.update(epi_valid_frac=self.epipolar_adapter.last_valid_frac)
+            if self.bev_occ_head is not None:
+                losses.update(self.forward_bev_occ(lm_loss['hidden_states'], input_ids, data['lidar2img'], image_grid_thw, data['img'].shape[-2:], img_metas))
+            if self.depth_skip and self.depth_skip_mode == 'add' and self.depth_orth_mode == 'soft':
+                orth = lm_loss['depth_orth_loss']
+                if orth is not None:
+                    losses.update(depth_orth_loss=self.depth_orth_lambda * orth)
             if self.io_3d_pos: 
                 # NOTE use mlp to decode the position embedding if self.pe_decode_method in ['l2_coords_mlp', 'l2_coords_mlp_2layer']
                 if self.pe_decode_method in ['l2_coords_mlp', 'l2_coords_mlp_2layer'] and self.io_3d_pos:
@@ -827,6 +1004,9 @@ class SpaceDrive(MVXTwoStageDetector):
                         else:
                             decoded_output_pos = self.mlp_output_coords(sampled_coords_pos).reshape(B, -1, 3)[:, :,:2]
                             lm_loss['loss_pos'] = self.loss_pos_func(decoded_output_pos, sampled_coords[:, :,:2]) * 0
+                        # teacher-forced waypoint errors (m); logged only. Zero when the batch has no GT plan
+                        # (keys must exist on every rank for the DDP log reduction).
+                        losses.update(tf_ade=decoded_output_pos.new_zeros(()), tf_fde=decoded_output_pos.new_zeros(()))
                     else:
                         if self.use_vae_to_replace_mlp:
                             decoded_output_pos, loss_vae_gen = self.vae_output_coords(lm_loss['output_pos'], lm_loss['gt_coords_xy'])
@@ -840,6 +1020,9 @@ class SpaceDrive(MVXTwoStageDetector):
                         decoded_output_pos = decoded_output_pos[:, :, :2]  # only take x,y coordinates
 
                         lm_loss['loss_pos'] = self.loss_pos_func(decoded_output_pos, lm_loss['gt_coords_xy']) * self.loss_pos_lambda
+                        with torch.no_grad():
+                            err = (decoded_output_pos.float() - lm_loss['gt_coords_xy'].float()).norm(dim=-1)  # (N, 6)
+                            losses.update(tf_ade=err.mean(), tf_fde=err[..., -1].mean())
 
                 elif self.pe_decode_method in ['cosine', 'l2']:
                     pass
@@ -887,9 +1070,13 @@ class SpaceDrive(MVXTwoStageDetector):
         B = pixel_values.shape[0]
         
         pos_embed = None
+        depth_aux = None
         if self.vis_3d_pos:
 
-            depth = self.depth_prediction(img,  data['intrinsics'])
+            if self.depth_film is not None:
+                depth, depth_aux = self.depth_prediction(img, data['intrinsics'], return_aux=True)
+            else:
+                depth = self.depth_prediction(img,  data['intrinsics'])
 
             location = self.prepare_location(image_grid_thw, pixel_values)
 
@@ -992,7 +1179,9 @@ class SpaceDrive(MVXTwoStageDetector):
                 len_input_ids = input_ids.shape[1]
 
                 if self.lm_type == 'qwenvl25':
-                    outputs = self.lm_head.generate( 
+                    vision_adapter = self._setup_geo_modules(depth, depth_aux, data['lidar2img'], image_grid_thw, input_ids) if self.vis_3d_pos else None
+                    try:
+                        outputs = self.lm_head.generate( 
                         # forward args
                         input_ids=input_ids,
                         pixel_values=pixel_values, 
@@ -1008,6 +1197,9 @@ class SpaceDrive(MVXTwoStageDetector):
                         enable_pe_input = self.enable_pe_input if self.io_3d_pos else False,
                         pos_index = coords3d if self.use_rope else None,
                         depth_feature = depth_add_feature,
+                        depth_orth_mode = self.depth_orth_mode if (self.depth_skip and self.depth_skip_mode == 'add') else 'none',
+                        depth_scale = self.depth_scale if (self.depth_skip and self.depth_skip_mode == 'add') else None,
+                        vision_adapter = vision_adapter,
                         coords_encoder = self.position_encoder_mlp if (not self.single_token_output and self.pe_decode_method is not None and 'mlp' in self.pe_decode_method and self.input_pe_mlp) else self.position_encoder,
                         coords_decoder = self.mlp_output_coords  if  (not self.single_token_output and self.pe_decode_method is not None  and 'mlp' in self.pe_decode_method and not self.use_vae_to_replace_mlp) else  (self.vae_output_coords if self.use_vae_to_replace_mlp else None),
                         ## output args
@@ -1022,6 +1214,8 @@ class SpaceDrive(MVXTwoStageDetector):
                         max_new_tokens=100,
                         use_cache=True
                     )
+                    finally:
+                        self._clear_geo_modules()
                 elif self.lm_type == 'llava': # NOTE: no adaption for rope as position encoding in llava, so we don't pass pos_index in this case
                     outputs = self.lm_head.generate( 
                         # forward args
@@ -1041,6 +1235,8 @@ class SpaceDrive(MVXTwoStageDetector):
                         coords_encoder = self.position_encoder_mlp if (not self.single_token_output and self.pe_decode_method is not None and 'mlp' in self.pe_decode_method and self.input_pe_mlp) else self.position_encoder,
                         coords_decoder = self.mlp_output_coords  if  (not self.single_token_output and self.pe_decode_method is not None  and 'mlp' in self.pe_decode_method and not self.use_vae_to_replace_mlp) else  (self.vae_output_coords if self.use_vae_to_replace_mlp else None),
                         depth_feature = depth_add_feature,
+                        depth_orth_mode = self.depth_orth_mode if (self.depth_skip and self.depth_skip_mode == 'add') else 'none',
+                        depth_scale = self.depth_scale if (self.depth_skip and self.depth_skip_mode == 'add') else None,
                         ## output args
                         output_hidden_states=True,
                         return_dict_in_generate=True,

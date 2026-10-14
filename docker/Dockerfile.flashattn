@@ -1,0 +1,12 @@
+# Flash-attention variant of the SpaceDrive image. Built on top of the main image
+# (spacedrive:v1.0) so the base environment stays identical; only flash-attn is added.
+ARG BASE_IMAGE=spacedrive:v1.0
+FROM ${BASE_IMAGE}
+
+# Official prebuilt wheel matching the base env: torch 2.1 / CUDA 11.8 / cxx11abi FALSE / py3.9.
+# 2.6.3 is the newest release with a cu118 + torch2.1 wheel. Hash-pinned for integrity.
+ARG FLASH_ATTN_WHL=https://github.com/Dao-AILab/flash-attention/releases/download/v2.6.3/flash_attn-2.6.3+cu118torch2.1cxx11abiFALSE-cp39-cp39-linux_x86_64.whl
+ARG FLASH_ATTN_SHA256=b9e51701e981d3c8df0988174a76b8e865027daea2c006e609c39f0fbeba7a2e
+
+RUN pip install --no-deps "flash_attn @ ${FLASH_ATTN_WHL}#sha256=${FLASH_ATTN_SHA256}" \
+    && python3.9 -c "import flash_attn, flash_attn_2_cuda; print('flash_attn', flash_attn.__version__)"

@@ -4,13 +4,14 @@ CONFIG=$1
 GPUS=$2
 NNODES=${NNODES:-1}
 NODE_RANK=${NODE_RANK:-0}
-PORT=${PORT:-29500}
+PORT=${PORT:-29501}
 MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 
 
 
 # Load config and find the checkpoint path
-CKPT_ITER='iter_21096.pth'
+# CKPT_ITER='iter_13609.pth'
+CKPT_ITER='latest.pth'
 CHECKPOINT=$(python -c "import importlib.util; spec = importlib.util.spec_from_file_location('config', '$CONFIG'); config = importlib.util.module_from_spec(spec); spec.loader.exec_module(config); print(config.work_dir + '$CKPT_ITER')")
 if [ -z "$CHECKPOINT" ]; then
     echo "Checkpoint not found in config file. Please provide a checkpoint path."
