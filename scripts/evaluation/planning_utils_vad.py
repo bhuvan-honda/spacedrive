@@ -328,7 +328,7 @@ class PlanningMetric:
         return drivable_area
 
     def evaluate_single_coll(
-        self, traj, segmentation, input_gt=None, gt_traj=None, index=None
+        self, traj, segmentation, input_gt=None, gt_traj=None, index=None, round_cells=False
     ):
         """
         traj: torch.Tensor (n_future, 2)
@@ -383,6 +383,9 @@ class PlanningMetric:
         trajs_ = copy.deepcopy(trajs)
         trajs_ = trajs_ / self.dx.to(trajs.device)
         trajs_ = trajs_.cpu().numpy() + rc_yaw  # (n_future, 32, 2)
+        if round_cells:
+            # official code truncates toward zero: a tiny negative coordinate shifts the box by a whole cell
+            trajs_ = np.rint(trajs_)
 
         r = trajs_[:, :, 0].astype(np.int32)
         r = np.clip(r, 0, self.bev_dimension[0] - 1)
@@ -410,6 +413,7 @@ class PlanningMetric:
         segmentation,
         index=None,
         ignore_gt=False,
+        round_cells=False,
     ):
         """
         trajs: torch.Tensor (B, n_future, 2)
@@ -430,7 +434,7 @@ class PlanningMetric:
 
         for i in range(B):
             gt_box_coll = self.evaluate_single_coll(
-                gt_trajs[i], segmentation[i], input_gt=True
+                gt_trajs[i], segmentation[i], input_gt=True, round_cells=round_cells
             )
 
             xx, yy = trajs[i, :, 0], trajs[i, :, 1]
@@ -455,6 +459,7 @@ class PlanningMetric:
                 gt_traj=gt_trajs[i],
                 input_gt=False,
                 index=None,
+                round_cells=round_cells,
             ).to(segmentation.device)
             if ignore_gt:
                 obj_box_coll_sum += (gt_box_coll).long()

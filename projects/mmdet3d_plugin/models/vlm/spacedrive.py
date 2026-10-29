@@ -36,7 +36,9 @@ from ..vlm_utils.custom_qwen import CustomQwen2_5_VLModel
 from ..vlm_utils.bev_occ_head import BEVOccHead, load_bev_occ_targets
 from ..vlm_utils.film import DepthFiLM
 from ..vlm_utils.epipolar_adapter import DepthEpipolarAdapter
+from ..vlm_utils.plucker_pe import PluckerRayPE
 from ..vlm_utils.geometry import token_rays, vis_token_mask
+from ...core.traj_format import num_plan_coords, half_second_index
 from functools import partial
 
 # Unidepth imports
@@ -95,6 +97,10 @@ class SpaceDrive(MVXTwoStageDetector):
                  bev_occ = None, # dict -> auxiliary BEV occupancy head on LLM vision-token hidden states (BEVOccHead kwargs), training only
                  depth_film = None, # dict -> FiLM of vision tokens in intermediate LLM layers on UniDepth features (DepthFiLM kwargs)
                  epipolar = None, # dict -> depth-guided epipolar cross-view adapter on the vision tokens (DepthEpipolarAdapter kwargs)
+                 plucker_pe = None, # dict -> Plücker ray embedding added to the vision-token 3D PE (PluckerRayPE kwargs)
+                 grad_ckpt_skip_layers = 0, # (Qwen) the last N LLM decoder layers keep their activations instead of gradient checkpointing: faster, more memory
+                 traj_format = None, # dict(num_wp, path_spacing, path_points, ...) -> planning answer layout (core/traj_format.py); None = 6 waypoints
+                 max_new_tokens = 100, # generation length at test time
                  ):
         
         super(SpaceDrive, self).__init__(train_cfg, test_cfg,)
@@ -135,6 +141,10 @@ class SpaceDrive(MVXTwoStageDetector):
 
         # paths
         self.save_path = save_path
+        self.max_new_tokens = max_new_tokens
+        self.num_plan_coords = num_plan_coords(traj_format)
+        self.num_traj_wp = traj_format['num_wp'] if traj_format else 6
+        self.plan_eval_idx = half_second_index(self.num_traj_wp)
 
         # concept testing config
         self.single_token_output = single_token_output # use single output token to decode 6 coords
@@ -157,7 +167,8 @@ class SpaceDrive(MVXTwoStageDetector):
 
         self.llm_hidden_dim = 4096
         if lm_head is not None:
-            self.lm_head = load_model(lm_head, tokenizer, use_lora, frozen, llm_lora_rank=llm_lora_rank, attn_implementation=attn_implementation)
+            self.lm_head = load_model(lm_head, tokenizer, use_lora, frozen, llm_lora_rank=llm_lora_rank, attn_implementation=attn_implementation,
+                                      grad_ckpt_skip_layers=grad_ckpt_skip_layers)
             self.lm_head.base_model.model.tokenizer = self.tokenizer
             if 'llava' in lm_head:
                 self.llm_hidden_dim =4096
@@ -314,6 +325,12 @@ class SpaceDrive(MVXTwoStageDetector):
         if epipolar is not None:
             assert self.vis_3d_pos, 'epipolar adapter needs the predicted depth'
             self.epipolar_adapter = DepthEpipolarAdapter(self.llm_hidden_dim, **epipolar)
+
+        # Plücker ray embedding added to the depth-based 3D PE of the vision tokens
+        self.plucker_pe = None
+        if plucker_pe is not None:
+            assert self.vis_3d_pos and not self.use_rope, 'plucker_pe is added to the additive vision-token 3D PE'
+            self.plucker_pe = PluckerRayPE(self.llm_hidden_dim, **plucker_pe)
 
     def _llm_decoder_layers(self):
         for m in self.lm_head.modules():
@@ -824,6 +841,8 @@ class SpaceDrive(MVXTwoStageDetector):
             location = self.prepare_location(image_grid_thw, pixel_values)
 
             pos_embed, coords3d = self.position_embeding(data, location, img_metas, depth, image_grid_thw, False, data['img'], sample_idx=img_metas[0]['sample_idx'])  # (6, 640, 640, 3) to (6,46,46). shape (B, seq_len, hidden_dim)
+            if self.plucker_pe is not None:
+                pos_embed = pos_embed + self.plucker_pe(data['lidar2img'], *self._token_grid(image_grid_thw), *depth.shape[-2:])
 
         io_coords_pos = None
         if self.io_3d_pos:
@@ -961,6 +980,7 @@ class SpaceDrive(MVXTwoStageDetector):
                 supervise_semantic_posemb=self.supervise_semantic_posemb if self.io_3d_pos else False,
                 planning_only=self.planning_only if self.io_3d_pos else False,
                 single_coords_only=self.single_coords_only if self.io_3d_pos else False,
+                num_plan_coords=self.num_plan_coords,
                 has_gt_planning=has_gt_planning if self.io_3d_pos else None,
                 gt_coords_xy = gt_coords_xy if self.io_3d_pos else None,
                 ego_feature = ego_feature if (self.ego_status or self.depth_skip) and ego_feature is not None and ego_feature.numel() > 0  else None,
@@ -1019,9 +1039,18 @@ class SpaceDrive(MVXTwoStageDetector):
 
                         decoded_output_pos = decoded_output_pos[:, :, :2]  # only take x,y coordinates
 
-                        lm_loss['loss_pos'] = self.loss_pos_func(decoded_output_pos, lm_loss['gt_coords_xy']) * self.loss_pos_lambda
+                        gt_xy = lm_loss['gt_coords_xy']
+                        if self.planning_only and self.num_plan_coords > self.num_traj_wp:
+                            # trajectory and path are averaged separately so the 20 path points do not dominate
+                            n = self.num_traj_wp
+                            lm_loss['loss_pos'] = (self.loss_pos_func(decoded_output_pos[:, :n], gt_xy[:, :n])
+                                                   + self.loss_pos_func(decoded_output_pos[:, n:], gt_xy[:, n:])) * self.loss_pos_lambda
+                        else:
+                            lm_loss['loss_pos'] = self.loss_pos_func(decoded_output_pos, gt_xy) * self.loss_pos_lambda
                         with torch.no_grad():
-                            err = (decoded_output_pos.float() - lm_loss['gt_coords_xy'].float()).norm(dim=-1)  # (N, 6)
+                            err = (decoded_output_pos.float() - gt_xy.float()).norm(dim=-1)  # (N, num coords)
+                            if self.planning_only:
+                                err = err[:, self.plan_eval_idx]  # the six 0.5 s waypoints
                             losses.update(tf_ade=err.mean(), tf_fde=err[..., -1].mean())
 
                 elif self.pe_decode_method in ['cosine', 'l2']:
@@ -1081,6 +1110,8 @@ class SpaceDrive(MVXTwoStageDetector):
             location = self.prepare_location(image_grid_thw, pixel_values)
 
             pos_embed, coords3d = self.position_embeding(data, location, img_metas, depth, image_grid_thw) 
+            if self.plucker_pe is not None:
+                pos_embed = pos_embed + self.plucker_pe(data['lidar2img'], *self._token_grid(image_grid_thw), *depth.shape[-2:])
 
         io_coords_pos = None
         if self.io_3d_pos and 'coords_pos_tensor' in data:
@@ -1211,7 +1242,7 @@ class SpaceDrive(MVXTwoStageDetector):
                         # top_p=0.75,
                         # num_beams=1,
                         ## others
-                        max_new_tokens=100,
+                        max_new_tokens=self.max_new_tokens,
                         use_cache=True
                     )
                     finally:
@@ -1246,7 +1277,7 @@ class SpaceDrive(MVXTwoStageDetector):
                         # top_p=0.75,
                         # num_beams=1,
                         ## others
-                        max_new_tokens=100,
+                        max_new_tokens=self.max_new_tokens,
                         use_cache=True
                     )
 

@@ -25,7 +25,7 @@ def make_row_mask_hook(allowed_row_indices):
         return grad
     return hook
 
-def load_model(base_model,tokenizer_path, use_lora, frozen, llm_lora_rank=16, attn_implementation=None):
+def load_model(base_model,tokenizer_path, use_lora, frozen, llm_lora_rank=16, attn_implementation=None, grad_ckpt_skip_layers=0):
 
     if 'Qwen2.5' in base_model:
         # attn_implementation=None keeps the transformers default (sdpa); 'flash_attention_2' needs the flash-attn image
@@ -34,6 +34,19 @@ def load_model(base_model,tokenizer_path, use_lora, frozen, llm_lora_rank=16, at
             base_model, torch_dtype=torch.bfloat16, device_map= {'':torch.cuda.current_device()}, local_files_only=True, **extra,
         )
         model.gradient_checkpointing_enable()
+        if grad_ckpt_skip_layers > 0:
+            # partial gradient checkpointing: the last N decoder layers run without recomputation
+            text_model = model.model.language_model
+            no_ckpt = {id(layer) for layer in text_model.layers[-grad_ckpt_skip_layers:]}
+            ckpt_func = text_model._gradient_checkpointing_func
+
+            def partial_ckpt_func(layer_call, *args):
+                if id(layer_call.__self__) in no_ckpt:
+                    return layer_call(*args)
+                return ckpt_func(layer_call, *args)
+
+            text_model._gradient_checkpointing_func = partial_ckpt_func
+            print(f'Gradient checkpointing disabled for the last {len(no_ckpt)} LLM decoder layers')
     
     
         if use_lora:

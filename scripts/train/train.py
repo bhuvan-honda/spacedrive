@@ -174,6 +174,14 @@ def main():
         # cfg.gpu_ids = range(world_size)
         cfg.gpu_ids = [torch.device(f'cuda:{i}') for i in range(world_size)]
 
+    if cfg.get('traj_format'):
+        # one planning-answer format (configs: top-level traj_format) for the model, train data and hook datasets
+        cfg.model.traj_format = cfg.traj_format
+        cfg.data.train.traj_format = cfg.traj_format
+        for hook in cfg.get('custom_hooks', []):
+            if 'dataset' in hook:
+                hook.dataset.traj_format = cfg.traj_format
+
     # create work_dir
     mmcv.mkdir_or_exist(osp.abspath(cfg.work_dir))
     # dump config

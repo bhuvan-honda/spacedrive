@@ -18,6 +18,9 @@ model = dict(
     save_path=results_path,
     attn_implementation='flash_attention_2',
     depth_skip_gpu_preprocess=True,
+    # partial gradient checkpointing: the last N of 28 LLM layers keep activations (~6.2 GB/layer at batch 8).
+    # GPUs 0-3 are shared and capped at 80 GB (nvidia-smi): N=4 -> ~63 GB allocated; elsewhere N=14 -> ~120 GB (~131 GB nvidia-smi of 141).
+    grad_ckpt_skip_layers=4 if {'0', '1', '2', '3'} & set(__import__('os').environ.get('CUDA_VISIBLE_DEVICES', '').split(',')) else 14,
 )
 
 checkpoint_config = dict(interval=num_iters_per_epoch, max_keep_ckpts=2)

@@ -18,6 +18,12 @@ import torch
 from tqdm import tqdm
 import threading
 import re
+import importlib.util
+
+_spec = importlib.util.spec_from_file_location('traj_format', osp.join(
+    osp.dirname(osp.abspath(__file__)), '../../projects/mmdet3d_plugin/core/traj_format.py'))
+traj_format = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(traj_format)
 
 from PIL import Image, ImageDraw
 
@@ -206,6 +212,7 @@ def main(args):
     anno_path = args.anno_path
     key_infos = pickle.load(open(osp.join(args.base_path, anno_path), 'rb'))
     preds = dict()
+    n_projected = 0
     for data in key_infos['infos']:
         if os.path.exists(pred_path+data['token']):
             with open(pred_path+data['token'],'r',encoding='utf8')as f:
@@ -217,6 +224,15 @@ def main(args):
                 elif 'spacedrive'in pred_path:
                     traj = pred_data[0]['A']
                     print(traj)
+                    if traj_format.is_new_format(traj):
+                        wp, path, dense = traj_format.split_answer(traj)
+                        half = traj_format.to_half_seconds(wp, dense)
+                        if half is not None and args.path_project and path is not None and len(path):
+                            half = traj_format.project_on_path(wp, path, traj_format.half_second_index(12 if dense else 6))
+                            n_projected += 1
+                        if half is not None:
+                            preds[data['token']] = half
+                        continue
                     try:
                         full_match = re.search(r'\[<POS_INDICATOR>\(([\d\.-]+, [\d\.-]+)\)\s*([\s\S]*<POS_INDICATOR>\([\d\.-]+, [\d\.-]+\)\s*)*', traj)
                     except Exception as e:
@@ -238,6 +254,8 @@ def main(args):
                         coordinates_array = np.floor(coordinates_array / discrete_coords) * discrete_coords
                     preds[data['token']] = coordinates_array
 
+    if args.path_project:
+        print(f'path projection applied to {n_projected} of {len(preds)} predictions')
 
     metric_dict = {
         'plan_obj_box_col_1s': 0,
@@ -348,6 +366,7 @@ if __name__ == "__main__":
     parser.add_argument('--num_threads', type=int, default=4, help='Number of threads to use.')
 
     parser.add_argument('--discrete_coords', type=float, default=0, help='resolution of discrete coordinates.')
+    parser.add_argument('--path_project', action='store_true', help='place the predicted waypoints on the predicted driving path (same distance travelled)')
 
     args = parser.parse_args()
     

@@ -11,6 +11,8 @@ from mmcv.runner import HOOKS, Hook, get_dist_info
 from mmdet3d.datasets import build_dataset
 from torch.utils.data import DataLoader, Subset
 
+from ..traj_format import is_new_format, split_answer, to_half_seconds
+
 TRAJ_RE = re.compile(r'\[<POS_INDICATOR>\(([\d\.-]+, [\d\.-]+)\)\s*([\s\S]*<POS_INDICATOR>\([\d\.-]+, [\d\.-]+\)\s*)*')
 COORD_RE = re.compile(r'\(\+?[\d\.-]+, \+?[\d\.-]+\)')
 NUM_RE = re.compile(r'-?\d+\.\d+')
@@ -20,6 +22,9 @@ def parse_traj(answer):
     """Same parsing as scripts/evaluation/eval_planning.py (spacedrive branch). Returns (K, 2) or None."""
     if not isinstance(answer, str):
         return None
+    if is_new_format(answer):
+        wp, _, dense = split_answer(answer)
+        return to_half_seconds(wp, dense)
     m = TRAJ_RE.search(answer)
     if not m:
         return None

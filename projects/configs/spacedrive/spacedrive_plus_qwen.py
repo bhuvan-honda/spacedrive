@@ -293,6 +293,36 @@ lr_config = dict(
 
 evaluation = dict(interval=num_iters_per_epoch*num_epochs, pipeline=test_pipeline)
 
+# Validation loss: teacher-forced training forward on a fixed val subset (whole scenes, GT-planning frames),
+# logged as val_vlm_loss / val_loss_pos. Disable with --cfg-options custom_hooks.0.interval=0
+val_loss_interval = num_iters_per_epoch // 4
+val_loss_pipeline = [
+    dict(t, base_vqa_path=data_root + 'vqa/val/', base_desc_path=data_root + 'desc/val/',
+         base_conv_path=data_root + 'conv/val/', base_key_path=data_root + 'keywords/val/')
+    if t['type'] == 'LoadAnnoatationVQA' else t
+    for t in train_pipeline if not t['type'].startswith('LoadPoints')  # points are not used by the model
+]
+custom_hooks = [
+    dict(
+        type='ValLossHook',
+        interval=val_loss_interval,
+        num_scenes=16,
+        workers=2,
+        dataset=dict(
+            type=dataset_type,
+            data_root=data_root,
+            ann_file=data_root + 'nuscenes2d_ego_temporal_infos_val_with_command_desc.pkl',
+            seq_mode=True,
+            seq_split_num=1,
+            pipeline=val_loss_pipeline,
+            classes=class_names,
+            modality=input_modality,
+            test_mode=False,
+            use_valid_flag=True,
+            filter_empty_gt=False,
+            box_type_3d='LiDAR')),
+]
+
 find_unused_parameters=False #### when use checkpoint, find_unused_parameters must be False
 checkpoint_config = dict(interval=num_iters_per_epoch//2, max_keep_ckpts=12)
 runner = dict(

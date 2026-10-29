@@ -39,10 +39,13 @@ class CustomNuScenesDataset(NuScenesDataset):
                  lane_path='./data/nuscenes/data_dict_sample.pkl',
                  lane_anno_file='./data/nuscenes/data_dict_subset_B_val.pkl',
                  eval_mode=['lane', 'det'],
+                 traj_format=None, # dict(num_wp, path_spacing, path_points, extra_file) -> planning answer format (LoadAnnoatationVQA)
                  *args, 
                  **kwargs):
         super().__init__(*args, **kwargs)
         
+        self.traj_format = traj_format
+        self.traj_extra = pickle.load(open(traj_format['extra_file'], 'rb')) if traj_format else None
         self.seq_mode = seq_mode
         self.eval_mode = eval_mode
         self.lane_info = pickle.load(open(lane_path, 'rb'))
@@ -196,6 +199,9 @@ class CustomNuScenesDataset(NuScenesDataset):
                     gt_planning_mask=info['gt_planning_mask'],
 
             ))
+            if self.traj_format:
+                input_dict['traj_format'] = self.traj_format
+                input_dict['traj_extra'] = self.traj_extra.get(info['token'])
             input_dict['ann_info'] = annos
             
         return input_dict

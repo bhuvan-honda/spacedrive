@@ -99,6 +99,7 @@ class CustomQwen2_5_VLForConditionalGeneration(Qwen2_5_VLForConditionalGeneratio
         supervise_semantic_posemb = False,
         planning_only: Optional[bool] = False,
         single_coords_only: Optional[bool] = False,
+        num_plan_coords: int = 6, # answer coords of the planning turn supervised by loss_pos (planning_only)
         has_gt_planning = torch.zeros(1),
         gt_coords_xy: Optional[torch.Tensor] = None,
         coords_encoder = None,
@@ -241,15 +242,29 @@ class CustomQwen2_5_VLForConditionalGeneration(Qwen2_5_VLForConditionalGeneratio
         if hidden_states.dtype != self.lm_head.weight.dtype:
             hidden_states = hidden_states.to(self.lm_head.weight.dtype)
 
-        logits = self.lm_head(hidden_states)
+        # Training: compute logits only at positions that have a next-token target (same loss; the full
+        # B x L x vocab fp32 logits dominate the memory for long VQA sequences). Inference: all positions.
+        lm_hidden = hidden_states
+        shift_labels = None
+        if labels is not None:
+            target_labels = labels
+            if io_coords_pos_mask is not None and not (supervise_semantic_posemb and include_semantic_posemb):
+                target_labels = labels.masked_fill(io_coords_pos_mask.squeeze(-1), IGNORE_INDEX)  # as in step 3
+            shift_labels = nn.functional.pad(target_labels, (0, 1), value=IGNORE_INDEX)[..., 1:]
+            target_mask = shift_labels != IGNORE_INDEX
+            shift_labels = shift_labels[target_mask]
+            lm_hidden = hidden_states[target_mask]  # (num_targets, hidden)
+
+        logits = self.lm_head(lm_hidden)
         if hasattr(self, 'new_lm_head'):
             if self.new_lm_head.weight.dtype != logits.dtype:
                 hidden_states = hidden_states.to(self.new_lm_head.weight.dtype)
-            new_logits = self.new_lm_head(hidden_states) # shape (bs, seq_len, new_tokens)
+                lm_hidden = lm_hidden.to(self.new_lm_head.weight.dtype)
+            new_logits = self.new_lm_head(lm_hidden) # shape (..., new_tokens)
             new_logits = new_logits.to(logits.dtype)
 
             # replace the logits for new tokens
-            logits = logits.index_copy(2, torch.arange(151665, 151667, device=logits.device), new_logits)
+            logits = logits.index_copy(-1, torch.arange(151665, 151667, device=logits.device), new_logits)
 
 
 
@@ -302,14 +317,14 @@ class CustomQwen2_5_VLForConditionalGeneration(Qwen2_5_VLForConditionalGeneratio
                 num_valid = has_gt_planning.sum()
                 
                 if planning_only:
-                    # only select the first six coords of every sample with gt planning for loss_pos calculation
+                    # only select the first num_plan_coords coords of every sample with gt planning for loss_pos calculation
                     if io_coords_pos is not None:
                         rank = answer_coords_mask.cumsum(-1)[answer_coords_mask] # 1-based index of each answer coord within its sample
                         sample_idx = answer_coords_mask.nonzero(as_tuple=True)[0]
-                        keep = (rank <= 6) & has_gt_planning.view(-1).bool().to(sample_idx.device)[sample_idx]
-                        output_pos = output_pos[keep].reshape(num_valid, 6, self.llm_hidden_dim)
-                        gt_pos = gt_pos[keep].reshape(num_valid, 6, self.llm_hidden_dim)
-                        gt_coords_xy = gt_coords_xy[keep].reshape(num_valid, 6, 2)
+                        keep = (rank <= num_plan_coords) & has_gt_planning.view(-1).bool().to(sample_idx.device)[sample_idx]
+                        output_pos = output_pos[keep].reshape(num_valid, num_plan_coords, self.llm_hidden_dim)
+                        gt_pos = gt_pos[keep].reshape(num_valid, num_plan_coords, self.llm_hidden_dim)
+                        gt_coords_xy = gt_coords_xy[keep].reshape(num_valid, num_plan_coords, 2)
                 elif single_coords_only:
                     # only select the first coords for loss_pos calculation
                     if io_coords_pos is not None: # NOTE: make sure it also has at least one coords
@@ -321,7 +336,7 @@ class CustomQwen2_5_VLForConditionalGeneration(Qwen2_5_VLForConditionalGeneratio
                     gt_coords_xy = gt_coords_xy.unsqueeze(0)
 
             
-            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size , weight=weighted_mask, num_items_in_batch=torch.tensor(B))
+            loss = self.loss_function(logits=logits, labels=None, vocab_size=self.config.vocab_size , weight=weighted_mask, num_items_in_batch=torch.tensor(B), shift_labels=shift_labels)
 
             if io_coords_pos_mask is not None:
 

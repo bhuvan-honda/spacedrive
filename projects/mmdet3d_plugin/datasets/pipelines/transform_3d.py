@@ -33,6 +33,7 @@ from shapely.geometry import MultiPoint, Polygon, LineString, Point
 from shapely.geometry import box as canvas_box
 from ..utils.data_utils import preprocess
 from ..utils.constants import DEFAULT_IMAGE_TOKEN, POS_EMBEDDING_TOKEN, POS_INDICATOR_TOKEN, IGNORE_INDEX
+from ...core.traj_format import DENSE_KEY, PATH_KEY, path_index
 import math
 import pickle
 
@@ -520,6 +521,7 @@ class LoadAnnoatationVQA():
             num_commands=3,
             enable_online_vqa=False,
             counter_only=False,
+            classes=None, # class order of gt_labels_3d (= dataset classes); default: OmniDrive order
             ):
         self.load_3d_pos = load_3d_pos
         self.planning_only = planning_only
@@ -570,7 +572,7 @@ class LoadAnnoatationVQA():
         self.base_conv_path = base_conv_path
         self.base_key_path = base_key_path
         self.lane_objs_info = pickle.load(open(lane_objs_info, 'rb'))
-        CLASSES = ('car', 'truck', 'trailer', 'bus', 'construction_vehicle',
+        CLASSES = classes or ('car', 'truck', 'trailer', 'bus', 'construction_vehicle',
                'bicycle', 'motorcycle', 'pedestrian', 'traffic_cone',
                'barrier')
         self.id2cat = {i: name for i, name in enumerate(CLASSES)}
@@ -870,6 +872,25 @@ class LoadAnnoatationVQA():
         coords = torch.tensor(coords, dtype=torch.float32)
         return coords
 
+    def format_planning_answer(self, planning_traj, fmt, extra):
+        """Planning answer for a traj_format (None -> the original 6-waypoint sentence); None if labels are missing."""
+        def pts(points):
+            return ', '.join(f"({format_number(p[0], 2)}, {format_number(p[1], 2)})" for p in points)
+
+        if not fmt:
+            return f"Here is the planning trajectory [{pts(planning_traj)}]."
+        if extra is None:
+            return None
+        if fmt['num_wp'] == 12:
+            if not extra['wp12_valid'].all():
+                return None
+            answer = f"Here is the {DENSE_KEY} [{pts(extra['wp12'])}]."
+        else:
+            answer = f"Here is the planning trajectory [{pts(planning_traj)}]."
+        if fmt.get('path_spacing', 0) > 0:
+            answer += f" Here is the {PATH_KEY} [{pts(extra['path'][path_index(fmt['path_spacing'], fmt['path_points'])])}]."
+        return answer
+
     def __call__(self, results):
         traj = None
         if 'gt_planning' in results.keys():
@@ -877,13 +898,12 @@ class LoadAnnoatationVQA():
             mask = results['gt_planning_mask'][:].any(axis=-1)
             planning_traj = planning_traj[mask]
             if len(planning_traj) == 6:
-                formatted_points = ', '.join(f"({format_number(point[0], 2)}, {format_number(point[1], 2)})" for point in planning_traj)
+                traj = self.format_planning_answer(planning_traj, results.get('traj_format'), results.get('traj_extra'))
+            if traj is not None:
                 traj_question = "Please provide the planning trajectory for the ego car without reasons."
 
                 if self.load_ego_command_in_question:
                     traj_question = results['command_desc'] + traj_question
-
-                traj = f"Here is the planning trajectory [{formatted_points}]."
 
                 if self.load_high_level_command:
                     traj = results['command_desc'] + traj
@@ -903,7 +923,7 @@ class LoadAnnoatationVQA():
 
         random.shuffle(sources)
         
-        has_gt_planning = not self.counter_only and 'gt_planning' in results.keys() and len(planning_traj) == 6 
+        has_gt_planning = not self.counter_only and traj is not None
 
         if has_gt_planning:
             sources = [
